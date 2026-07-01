@@ -1,0 +1,51 @@
+name: Build and Push to GHCR
+
+on:
+  push:
+    branches:
+      - 'v1.4.23-patched'
+      - 'feat/dynamic-filer-override'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Downcase repo owner name
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >> $GITHUB_ENV
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
+      - name: Build and push CSI Driver
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./cmd/seaweedfs-csi-driver/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/seaweedfs-csi-driver:${{ github.ref_name }}
+
+      - name: Build and push Mount Service
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./cmd/seaweedfs-mount/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/seaweedfs-mount:${{ github.ref_name }}
