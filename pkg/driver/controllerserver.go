@@ -130,15 +130,9 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 	glog.V(4).Infof("deleting volume %s", volumeId)
 
-	// Parse filer override if present in VolumeID
-	filerAddress, volumeId := DecodeVolumeID(req.VolumeId)
-	if clean := path.Clean(volumeId); clean == "." || clean == "/" || clean == "/buckets" {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", req.VolumeId)
-	}
-
-	clientDriver := cs.Driver
-	if filerAddress != "" {
-		clientDriver = cs.Driver.CloneWithFiler(filerAddress)
+	clientDriver, volumeId, err := cs.parseVolumeID(req.VolumeId)
+	if err != nil {
+		return nil, err
 	}
 
 	var parentDir, volumeName string
@@ -204,15 +198,9 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities missing in request")
 	}
 
-	// Parse filer override if present in VolumeID
-	filerAddress, volumeId := DecodeVolumeID(req.VolumeId)
-	if clean := path.Clean(volumeId); clean == "." || clean == "/" || clean == "/buckets" {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", req.VolumeId)
-	}
-
-	clientDriver := cs.Driver
-	if filerAddress != "" {
-		clientDriver = cs.Driver.CloneWithFiler(filerAddress)
+	clientDriver, volumeId, err := cs.parseVolumeID(req.VolumeId)
+	if err != nil {
+		return nil, err
 	}
 
 	var parentDir, volumeName string
@@ -331,4 +319,17 @@ func isValidVolumeCapabilities(driverVolumeCaps []*csi.VolumeCapability_AccessMo
 		}
 	}
 	return foundAll
+}
+
+func (cs *ControllerServer) parseVolumeID(volumeID string) (filer_pb.FilerClient, string, error) {
+	filerAddress, parsedPath := DecodeVolumeID(volumeID)
+	if clean := path.Clean(parsedPath); clean == "." || clean == "/" || clean == "/buckets" {
+		return nil, "", status.Errorf(codes.InvalidArgument, "invalid volume ID %q", volumeID)
+	}
+
+	clientDriver := cs.Driver
+	if filerAddress != "" {
+		clientDriver = cs.Driver.CloneWithFiler(filerAddress)
+	}
+	return clientDriver, parsedPath, nil
 }
