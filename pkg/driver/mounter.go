@@ -62,6 +62,14 @@ func (m *mountServiceMounter) Mount(target string) (Unmounter, error) {
 		filers[i] = string(address)
 	}
 
+	// Prefer the stateless filer encoded in VolumeID. Fall back to volume
+	// context only for legacy/static volumes that do not encode a filer.
+	if filerAddr, _ := DecodeVolumeID(m.volumeID); filerAddr != "" {
+		filers = []string{filerAddr}
+	} else if customFiler, ok := m.volContext["filer"]; ok && customFiler != "" {
+		filers = []string{customFiler}
+	}
+
 	cacheDir := GetCacheDir(m.driver.CacheDir, m.volumeID)
 	localSocket := GetLocalSocket(m.driver.volumeSocketDir, m.volumeID)
 
@@ -101,9 +109,11 @@ func (m *mountServiceMounter) buildMountArgs(targetPath, cacheDir, localSocket s
 	}
 
 	var filerPath string
-	if path.IsAbs(m.volumeID) {
+	_, cleanVolumeID := DecodeVolumeID(m.volumeID)
+
+	if path.IsAbs(cleanVolumeID) {
 		// path already resolved in controller and passed as volumeID
-		filerPath = m.volumeID
+		filerPath = cleanVolumeID
 	} else {
 		// non-absolute-path volume ID, volume is either legacy or this is a static provision
 		contextPath := volumeContext["path"]

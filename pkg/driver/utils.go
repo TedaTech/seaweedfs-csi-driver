@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,4 +190,30 @@ func CheckDataLocality(dataLocality *datalocality.DataLocality, dataCenter *stri
 		return fmt.Errorf("dataLocality set, but not all locality-definitions were set")
 	}
 	return nil
+}
+
+// EncodeVolumeID constructs a structured volume ID from filerAddress and volumePath.
+// If filerAddress is empty, it returns the volumePath directly.
+// Otherwise, it formats it as a "filer://<filerAddress><volumePath>" URI.
+func EncodeVolumeID(filerAddress, volumePath string) string {
+	if filerAddress == "" {
+		return volumePath
+	}
+	u := &url.URL{
+		Scheme: "filer",
+		Host:   filerAddress,
+		Path:   volumePath,
+	}
+	return u.String()
+}
+
+// DecodeVolumeID parses a structured volume ID into filerAddress and volumePath.
+// If the volumeId is a valid "filer://" URI, it parses the host and path.
+// Otherwise, it returns an empty filerAddress and the original volumeId as the volumePath.
+func DecodeVolumeID(volumeID string) (string, string) {
+	u, err := url.Parse(volumeID)
+	if err != nil || u.Scheme != "filer" {
+		return "", volumeID
+	}
+	return u.Host, u.Path
 }
