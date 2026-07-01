@@ -130,7 +130,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 	glog.V(4).Infof("deleting volume %s", volumeId)
 
-	clientDriver, volumeId, err := cs.parseVolumeID(req.VolumeId)
+	clientDriver, volumeId, err := cs.resolveVolume(req.VolumeId)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities missing in request")
 	}
 
-	clientDriver, volumeId, err := cs.parseVolumeID(req.VolumeId)
+	clientDriver, volumeId, err := cs.resolveVolume(req.VolumeId)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +321,7 @@ func isValidVolumeCapabilities(driverVolumeCaps []*csi.VolumeCapability_AccessMo
 	return foundAll
 }
 
-func (cs *ControllerServer) parseVolumeID(volumeID string) (filer_pb.FilerClient, string, error) {
+func (cs *ControllerServer) resolveVolume(volumeID string) (filer_pb.FilerClient, string, error) {
 	filerAddress, parsedPath := DecodeVolumeID(volumeID)
 	if clean := path.Clean(parsedPath); clean == "." || clean == "/" || clean == "/buckets" {
 		return nil, "", status.Errorf(codes.InvalidArgument, "invalid volume ID %q", volumeID)
