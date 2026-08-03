@@ -43,6 +43,7 @@ func NewNodeServer(n *SeaweedFsDriver) *NodeServer {
 		cleanupStagingFn: cleanupStaleStagingPath,
 		unmountFn:        mountutil.Unmount,
 		bindMountFn:      defaultBindMount,
+		statfsFn:         statfsUsage,
 	}
 	ns.startHealthMonitor(defaultHealthCheckInterval)
 	return ns

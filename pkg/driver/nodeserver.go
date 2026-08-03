@@ -63,6 +63,7 @@ type NodeServer struct {
 	cleanupStagingFn func(stagingPath string) error
 	unmountFn        func(path string) error
 	bindMountFn      BindMountFn
+	statfsFn         StatfsFn
 }
 
 var _ = csi.NodeServer(&NodeServer{})
@@ -318,6 +319,17 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 				Type: &csi.NodeServiceCapability_Rpc{
 					Rpc: &csi.NodeServiceCapability_RPC{
 						Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+					},
+				},
+			},
+			// Without this kubelet never calls NodeGetVolumeStats, so
+			// every volume this driver serves is absent from
+			// kubelet_volume_stats_* — no usage graphs, and capacity
+			// alert rules that select nothing.
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 					},
 				},
 			},
