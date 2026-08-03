@@ -265,6 +265,51 @@ jobs:
           
           echo "PASS: Functional test passed"
 
+      - name: Verify kubelet reports volume stats
+        run: |
+          # NodeGetVolumeStats only reaches Prometheus if the driver
+          # advertises GET_VOLUME_STATS; drop that capability and the
+          # kubelet_volume_stats_* series vanish silently, which is a
+          # missing graph and a capacity alert that selects nothing
+          # rather than a failure anyone would notice.
+          #
+          # Kubelet's volume-stats aggregator runs on a ~1 minute period,
+          # so poll rather than sampling once.
+          NODE=$(kubectl get pod test-pod -o jsonpath='{.spec.nodeName}')
+
+          for i in $(seq 1 18); do
+            METRICS=$(kubectl get --raw "/api/v1/nodes/${NODE}/proxy/metrics" \
+              | grep 'kubelet_volume_stats_.*persistentvolumeclaim="test-pvc"' || true)
+            if [ -n "$METRICS" ]; then
+              break
+            fi
+            echo "attempt $i: no volume stats yet, waiting..."
+            sleep 10
+          done
+
+          if [ -z "$METRICS" ]; then
+            echo "FAIL: kubelet reports no volume stats for test-pvc"
+            kubectl logs -l app=seaweedfs-node --tail=100 || true
+            exit 1
+          fi
+          echo "$METRICS"
+
+          echo "$METRICS" | grep -q '^kubelet_volume_stats_capacity_bytes' || {
+            echo "FAIL: no capacity series"; exit 1; }
+
+          # The pod wrote files above, so a zero used-inode count means the
+          # INODES usage entry is being dropped or mis-populated. Its total
+          # and free counts are SeaweedFS's MaxInt64 "unbounded" sentinel;
+          # only the used count carries information.
+          echo "$METRICS" | awk '
+            /^kubelet_volume_stats_inodes_used/ { found = 1; if ($2 + 0 > 0) ok = 1 }
+            END {
+              if (!found) { print "FAIL: kubelet_volume_stats_inodes_used is missing"; exit 1 }
+              if (!ok)    { print "FAIL: kubelet_volume_stats_inodes_used is zero"; exit 1 }
+            }'
+
+          echo "PASS: kubelet reports byte and inode stats for test-pvc"
+
       - name: Test weed mount crash recovery (issue #261)
         run: |
           # Reproduce the scenario from

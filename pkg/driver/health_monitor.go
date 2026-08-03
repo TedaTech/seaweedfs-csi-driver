@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"runtime/debug"
 	"time"
 
@@ -46,40 +47,20 @@ func (ns *NodeServer) runHealthCheckTick() {
 }
 
 // checkHealth runs isHealthyFn with a timeout so a hung FUSE daemon
-// cannot stall the monitor sweep. On timeout the path is considered
-// unhealthy, which either triggers recovery (if it really is dead) or
-// is harmlessly retried on the next tick (if it was just slow). The
-// background goroutine is allowed to leak on timeout — it will exit
-// whenever the underlying filesystem call eventually returns.
-//
-// The inner goroutine has its own panic recovery so a crashing
-// isHealthyFn cannot take down the whole driver process.
+// cannot stall the monitor sweep. Both a timeout and a panic inside
+// isHealthyFn count as unhealthy, which either triggers recovery (if the
+// mount really is dead) or is harmlessly retried on the next tick (if it
+// was just slow).
 func (ns *NodeServer) checkHealth(path string) bool {
-	done := make(chan bool, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				glog.Errorf("health monitor: health check for %s panicked: %v\n%s", path, r, debug.Stack())
-				// Treat a panic as unhealthy and unblock the caller
-				// so it does not have to wait for the timeout. The
-				// channel is buffered (size 1) and no prior send has
-				// happened on this path, so this non-blocking send
-				// is always safe.
-				select {
-				case done <- false:
-				default:
-				}
-			}
-		}()
-		done <- ns.isHealthyFn(path)
-	}()
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(defaultHealthCheckTimeout):
-		glog.Warningf("health monitor: health check for %s timed out after %v, treating as unhealthy", path, defaultHealthCheckTimeout)
+	healthy, err := runWithTimeout(
+		defaultHealthCheckTimeout,
+		fmt.Sprintf("health monitor: health check for %s", path),
+		func() (bool, error) { return ns.isHealthyFn(path), nil },
+	)
+	if err != nil {
 		return false
 	}
+	return healthy
 }
 
 // checkAndRecoverVolumes iterates the volume map and launches one
