@@ -91,7 +91,11 @@ func (ns *NodeServer) loadPersistedVolumeAttributes(ctx context.Context, volumeI
 	if ns.vacLoader != nil {
 		return ns.vacLoader(ctx, volumeID)
 	}
-	return newFilerVacStore(ns.Driver.filers).Read(ctx, volumeID)
+	store, err := newFilerVacStore(ns.Driver.filers)
+	if err != nil {
+		return nil, err
+	}
+	return store.Read(ctx, volumeID)
 }
 
 var _ = csi.NodeServer(&NodeServer{})
