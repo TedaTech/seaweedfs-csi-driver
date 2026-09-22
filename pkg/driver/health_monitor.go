@@ -123,15 +123,49 @@ func (ns *NodeServer) runHealthCheckTick() {
 // mount really is dead) or is harmlessly retried on the next tick (if it
 // was just slow).
 func (ns *NodeServer) checkHealth(path string) bool {
+	healthy, _ := ns.checkHealthDetailed(path)
+	return healthy
+}
+
+// checkHealthDetailed additionally reports whether the probe ran out of time,
+// which is a materially weaker statement than "the mount is dead" and is kept
+// separate so metrics and recovery decisions can tell them apart.
+func (ns *NodeServer) checkHealthDetailed(path string) (healthy bool, timedOut bool) {
 	healthy, err := runWithTimeout(
 		defaultHealthCheckTimeout,
 		fmt.Sprintf("health monitor: health check for %s", path),
 		func() (bool, error) { return ns.isHealthyFn(path), nil },
 	)
 	if err != nil {
+		return false, true
+	}
+	return healthy, false
+}
+
+// probeStaging runs the staging-mount probe and records what it found. The
+// returned bool is the same verdict checkHealth would give.
+func (ns *NodeServer) probeStaging(volumeID, path string) bool {
+	healthy, timedOut := ns.checkHealthDetailed(path)
+	if healthy {
+		recordHealthProbe(volumeID, probeHealthy)
+		setSessionUp(volumeID, true)
+		return true
+	}
+
+	if ns.corrupted(path) {
+		recordHealthProbe(volumeID, probeCorrupted)
+		setSessionUp(volumeID, false)
 		return false
 	}
-	return healthy
+
+	// Not corrupted: the daemon is still there as far as we can prove.
+	if timedOut {
+		recordHealthProbe(volumeID, probeTimeout)
+	} else {
+		recordHealthProbe(volumeID, probeUnmounted)
+	}
+	setSessionUp(volumeID, true)
+	return false
 }
 
 // checkAndRecoverVolumes iterates the volume map and launches one
@@ -195,7 +229,7 @@ func (ns *NodeServer) performVolumeHealthCheck(volumeID string) {
 		return
 	}
 
-	if !ns.checkHealth(vol.StagedPath) {
+	if !ns.probeStaging(volumeID, vol.StagedPath) {
 		glog.Warningf("health monitor: detected unhealthy staging mount for volume %s at %s", volumeID, vol.StagedPath)
 		ns.recoverVolume(volumeID)
 		return
@@ -295,6 +329,7 @@ func (ns *NodeServer) retryPublishPaths(volumeID string) {
 
 func (ns *NodeServer) recoverVolume(volumeID string) {
 	if ns.recoveryThrottled(volumeID) {
+		recordRecovery(volumeID, recoveryOutcomeThrottled)
 		glog.V(4).Infof("health monitor: volume %s is within its recovery backoff window, skipping", volumeID)
 		return
 	}
@@ -364,6 +399,7 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 	// blast radius is therefore empty.
 	if len(publishes) > 0 && !ns.corrupted(stagingPath) {
 		ns.noteRecoveryAttempt(volumeID)
+		recordRecovery(volumeID, recoveryOutcomeSkippedNotCorrupted)
 		glog.Warningf("health monitor: volume %s failed its health probe but the FUSE daemon at %s is not corrupted and %d publish path(s) are live; skipping recovery", volumeID, stagingPath, len(publishes))
 		return
 	}
@@ -383,6 +419,7 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 			// Aborting is safer than continuing: RemoveAll on a path the
 			// manager still considers mounted risks deleting user data
 			// through a live FUSE.
+			recordRecovery(volumeID, recoveryOutcomeFailed)
 			glog.Errorf("health monitor: unmount via mount manager failed for volume %s, aborting recovery: %v", volumeID, err)
 			return
 		}
@@ -392,12 +429,14 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 	// gRPC. FUSE can still be alive here if vol.unmounter was nil
 	// (rebuilt volume) or wait()'s kubeMounter.Unmount silently failed.
 	if notMnt, err := mountutil.IsLikelyNotMountPoint(stagingPath); err == nil && !notMnt {
+		recordRecovery(volumeID, recoveryOutcomeFailed)
 		glog.Errorf("health monitor: refusing to clean up staging path %s for volume %s — still a mount point; aborting recovery to avoid data deletion", stagingPath, volumeID)
 		return
 	}
 
 	// Step 2: Clean up stale staging path
 	if err := ns.cleanupStagingFn(stagingPath); err != nil {
+		recordRecovery(volumeID, recoveryOutcomeFailed)
 		glog.Errorf("health monitor: failed to cleanup stale staging for volume %s: %v", volumeID, err)
 		return
 	}
@@ -405,6 +444,7 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 	// Step 3: Re-stage with a fresh FUSE mount.
 	newVol, err := ns.stageNewVolume(volumeID, stagingPath, vol.volContext, vol.readOnly)
 	if err != nil {
+		recordRecovery(volumeID, recoveryOutcomeFailed)
 		glog.Errorf("health monitor: failed to re-stage volume %s: %v", volumeID, err)
 		return
 	}
@@ -456,9 +496,13 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 	}
 
 	if len(failed) > 0 {
+		recordRecovery(volumeID, recoveryOutcomeFailed)
 		glog.Warningf("health monitor: volume %s recovered with %d publish path failure(s); retryPublishPaths will retry on the next sweep", volumeID, len(failed))
 		return
 	}
+
+	recordRecovery(volumeID, recoveryOutcomeSuccess)
+	setSessionUp(volumeID, true)
 
 	// Deliberately not clearing the backoff here. A recovery that reports
 	// success and then fails again two minutes later is precisely the flap

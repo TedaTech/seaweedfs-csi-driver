@@ -34,6 +34,7 @@ var (
 	dataCenter           = flag.String("dataCenter", "", "dataCenter this node is running in (locality-definition)")
 	dataLocalityStr      = flag.String("dataLocality", "", "which volume-nodes pods will use for activity (one-of: 'write_preferLocalDc'). Requires used locality-definitions to be set")
 	topologyKeys         = flag.String("topologyKeys", "", "comma-separated node label keys reported as accessible topology, e.g. topology.kubernetes.io/zone")
+	metricsAddress       = flag.String("metricsAddress", ":9810", "address the node plugin serves Prometheus metrics on at /metrics; empty disables it")
 	dataLocality         datalocality.DataLocality
 	parsedMountExtraArgs []string
 )
@@ -101,6 +102,12 @@ func main() {
 	drv.DataCenter = *dataCenter
 	drv.DataLocality = dataLocality
 	drv.TopologyKeys = driver.ParseTopologyKeys(*topologyKeys)
+
+	// Node-only: the counters describe per-node FUSE sessions, and the
+	// controller runs as a Deployment where the address would collide.
+	if runNode && *metricsAddress != "" {
+		driver.ServeMetrics(*metricsAddress)
+	}
 
 	drv.Run()
 }

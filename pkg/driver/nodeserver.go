@@ -439,6 +439,8 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 	// remove mutex on successfull unstage
 	ns.volumeMutexes.RemoveMutex(volumeID)
+	ns.recoveryBackoff.Delete(volumeID)
+	forgetVolumeMetrics(volumeID)
 
 	glog.Infof("volume %s successfully unstaged from %s", volumeID, stagingTargetPath)
 
