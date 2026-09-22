@@ -215,6 +215,10 @@ type mountInfoEntry struct {
 	root       string
 	mountpoint string
 	fstype     string
+	// readOnly reflects the per-mount options field (field 6). A pod may
+	// bind a shared volume read-only while another binds it read-write,
+	// so this is per publish path, not per volume.
+	readOnly bool
 }
 
 // parseMountInfo parses /proc/<pid>/mountinfo and returns entries.
@@ -245,6 +249,13 @@ func parseMountInfoReader(r io.Reader) ([]mountInfoEntry, error) {
 		device := fields[2]
 		root := unescapeMountField(fields[3])
 		mountpoint := unescapeMountField(fields[4])
+		readOnly := false
+		for _, opt := range strings.Split(fields[5], ",") {
+			if opt == "ro" {
+				readOnly = true
+				break
+			}
+		}
 
 		// Find the "-" separator to get fstype
 		sepIdx := -1
@@ -264,6 +275,7 @@ func parseMountInfoReader(r io.Reader) ([]mountInfoEntry, error) {
 			root:       root,
 			mountpoint: mountpoint,
 			fstype:     fstype,
+			readOnly:   readOnly,
 		})
 	}
 	return entries, scanner.Err()
@@ -464,4 +476,52 @@ func remountViaSetns(containerPID int, containerMountPath, stagingPath, subPath 
 	}
 
 	return nil
+}
+
+// findPublishPathsByDevice returns the CSI publish binds on this node that are
+// backed by the same FUSE session as stagingPath, with the read-only flag each
+// was bound with.
+//
+// The node plugin sees them because it mounts the kubelet directory; they are
+// the pod-visible half of a staged volume. Recovering them matters for more
+// than re-binding: recoverVolume only protects a volume that has publish paths
+// recorded, so a restored volume with an empty set would be torn down on a
+// slow probe while pods were still using it.
+func findPublishPathsByDevice(device, stagingPath string) (map[string]bool, error) {
+	entries, err := parseMountInfo(os.Getpid())
+	if err != nil {
+		return nil, err
+	}
+	return filterPublishPaths(entries, device, stagingPath), nil
+}
+
+// filterPublishPaths selects the CSI publish binds sharing a device. Split out
+// from findPublishPathsByDevice so the selection rules can be tested without a
+// live /proc.
+func filterPublishPaths(entries []mountInfoEntry, device, stagingPath string) map[string]bool {
+	paths := make(map[string]bool)
+	for _, e := range entries {
+		if e.device != device || !isFuseFS(e.fstype) {
+			continue
+		}
+		if e.mountpoint == stagingPath || !isCSIPublishPath(e.mountpoint) {
+			continue
+		}
+		paths[e.mountpoint] = e.readOnly
+	}
+	return paths
+}
+
+// isCSIPublishPath reports whether a mountpoint is a kubelet CSI publish
+// target, i.e. .../pods/<uid>/volumes/kubernetes.io~csi/<name>/mount. Anything
+// else sharing the device — subPath binds, the staging mount itself — is not
+// something NodeUnpublishVolume would ever be called for.
+func isCSIPublishPath(mountpoint string) bool {
+	if filepath.Base(mountpoint) != "mount" {
+		return false
+	}
+	if extractPodUID(mountpoint) == "" {
+		return false
+	}
+	return strings.Contains(mountpoint, "/volumes/kubernetes.io~csi/")
 }

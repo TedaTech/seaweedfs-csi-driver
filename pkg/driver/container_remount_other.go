@@ -14,3 +14,9 @@ func remountStaleFuseInContainers(publishPath, stagingPath string, readOnly bool
 func getMountDevice(mountPath string) (string, error) {
 	return "", nil
 }
+
+// findPublishPathsByDevice is a stub on non-Linux platforms; discovering the
+// binds requires /proc/<pid>/mountinfo.
+func findPublishPathsByDevice(device, stagingPath string) (map[string]bool, error) {
+	return nil, nil
+}

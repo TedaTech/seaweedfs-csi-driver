@@ -47,6 +47,9 @@ func NewNodeServer(n *SeaweedFsDriver) *NodeServer {
 		bindMountFn:      defaultBindMount,
 		statfsFn:         statfsUsage,
 	}
+	// Adopt what the mount service already owns before the first sweep, so
+	// a plugin restart does not silently stop monitoring live mounts.
+	ns.restoreVolumes()
 	ns.startHealthMonitor(defaultHealthCheckInterval)
 	return ns
 }

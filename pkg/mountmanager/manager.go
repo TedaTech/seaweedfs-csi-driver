@@ -158,6 +158,41 @@ func (m *Manager) Unmount(req *UnmountRequest) (*UnmountResponse, error) {
 	return &UnmountResponse{}, nil
 }
 
+// List returns the volumes the manager currently owns. The node plugin uses
+// it to rebuild its in-memory volume map after a restart: the mount service
+// outlives the plugin, so it is the only authority on what is mounted on this
+// node. Entries whose weed mount process has already exited are skipped —
+// watchProcessExit removes them, but a caller landing mid-exit should not be
+// handed a volume that is on its way out.
+func (m *Manager) List() *ListResponse {
+	m.mu.Lock()
+	entries := make([]*mountEntry, 0, len(m.mounts))
+	for _, entry := range m.mounts {
+		entries = append(entries, entry)
+	}
+	m.mu.Unlock()
+
+	resp := &ListResponse{Mounts: make([]MountInfo, 0, len(entries))}
+	for _, entry := range entries {
+		if entry.process != nil {
+			select {
+			case <-entry.process.exited:
+				continue
+			default:
+			}
+		}
+		resp.Mounts = append(resp.Mounts, MountInfo{
+			VolumeID:      entry.volumeID,
+			TargetPath:    entry.targetPath,
+			CacheDir:      entry.cacheDir,
+			LocalSocket:   entry.localSocket,
+			VolumeContext: entry.volumeContext,
+			ReadOnly:      entry.readOnly,
+		})
+	}
+	return resp
+}
+
 func (m *Manager) getMount(volumeID string) *mountEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -209,11 +244,13 @@ func (m *Manager) startMount(req *MountRequest) (*mountEntry, error) {
 	}
 
 	return &mountEntry{
-		volumeID:    req.VolumeID,
-		targetPath:  targetPath,
-		cacheDir:    cacheDir,
-		localSocket: localSocket,
-		process:     process,
+		volumeID:      req.VolumeID,
+		targetPath:    targetPath,
+		cacheDir:      cacheDir,
+		localSocket:   localSocket,
+		volumeContext: req.VolumeContext,
+		readOnly:      req.ReadOnly,
+		process:       process,
 	}, nil
 }
 
@@ -269,7 +306,11 @@ type mountEntry struct {
 	targetPath  string
 	cacheDir    string
 	localSocket string
-	process     *weedMountProcess
+	// volumeContext and readOnly are carried purely so List can return
+	// them; the mount itself is fully described by the process args.
+	volumeContext map[string]string
+	readOnly      bool
+	process       *weedMountProcess
 }
 
 type weedMountProcess struct {
