@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeMountState tracks the behavior of a fake FUSE mount across a
@@ -110,6 +111,9 @@ func newNodeServerWithFakes(t *testing.T, state *fakeMountState) *NodeServer {
 		},
 		isHealthyFn: func(path string) bool {
 			return state.isHealthy(path)
+		},
+		isCorruptedFn: func(path string) bool {
+			return !state.isHealthy(path)
 		},
 		cleanupStagingFn: func(path string) error {
 			state.mu.Lock()
@@ -509,5 +513,193 @@ func TestHealthMonitorRetriesFailedPublishes(t *testing.T) {
 	// The publish path was re-bound: bindMountCalls went up by 1.
 	if state.bindMountCalls != initialBind+1 {
 		t.Errorf("expected %d bind mounts after retry, got %d", initialBind+1, state.bindMountCalls)
+	}
+}
+
+// stageAndPublish sets up a staged volume with one publish path, the shape
+// the guard tests care about.
+func stageAndPublish(t *testing.T, ns *NodeServer, state *fakeMountState, volumeID string) (*Volume, string) {
+	t.Helper()
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	publishPath := filepath.Join(root, "pod", "mount")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume(volumeID, stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	ns.volumes.Store(volumeID, vol)
+
+	if err := vol.Publish(stagingPath, publishPath, false); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	vol.AddPublishPath(publishPath, false)
+
+	_ = state
+	return vol, stagingPath
+}
+
+// A probe that merely times out must not cost live consumers their FUSE
+// session. This is the 2026-09-08 edunorm data-loss regression: a 9 698-entry
+// mount root outran the 5s health-check budget, the monitor called the mount
+// unhealthy, and recovery killed the weed mount process every pod on the node
+// shared.
+func TestHealthMonitorSkipsRecoveryWhenMountIsNotCorrupted(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+	// Probe fails (slow), but the FUSE daemon is alive.
+	ns.isCorruptedFn = func(string) bool { return false }
+
+	_, _ = stageAndPublish(t, ns, state, "vol-slow")
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.unstageCalls != 0 {
+		t.Errorf("a slow probe must not tear down a live FUSE session, got %d unstage calls", state.unstageCalls)
+	}
+	if state.cleanupCalls != 0 {
+		t.Errorf("expected no staging cleanup, got %d", state.cleanupCalls)
+	}
+	if state.stageCalls != 1 {
+		t.Errorf("expected no re-stage (1 initial stage), got %d", state.stageCalls)
+	}
+}
+
+// The counterpart: a provably dead daemon still recovers exactly as before.
+func TestHealthMonitorRecoversWhenMountIsCorrupted(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+	ns.isCorruptedFn = func(string) bool { return true }
+
+	_, _ = stageAndPublish(t, ns, state, "vol-dead")
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.unstageCalls != 1 {
+		t.Errorf("expected 1 mount-manager teardown, got %d", state.unstageCalls)
+	}
+	if state.stageCalls != 2 {
+		t.Errorf("expected a re-stage after recovery, got %d stage calls", state.stageCalls)
+	}
+}
+
+// With nothing published against it, the blast radius is empty and a volume
+// that fails its probe may be recovered without proving corruption.
+func TestHealthMonitorRecoversUnpublishedVolumeWithoutCorruption(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+	ns.isCorruptedFn = func(string) bool { return false }
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume("vol-unpublished", stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	ns.volumes.Store("vol-unpublished", vol)
+
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.unstageCalls != 1 {
+		t.Errorf("expected recovery to proceed with no publish paths, got %d unstage calls", state.unstageCalls)
+	}
+}
+
+// Repeated failures must widen the window rather than tearing the mount down
+// on every 30s sweep — the 15-recoveries-in-40-minutes flap seen on
+// talos-d15-b62 on 2026-09-16.
+func TestHealthMonitorBacksOffRepeatedRecoveries(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+	ns.isCorruptedFn = func(string) bool { return true }
+
+	now := time.Now()
+	ns.nowFn = func() time.Time { return now }
+
+	_, _ = stageAndPublish(t, ns, state, "vol-flap")
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	afterFirst := state.unstageCalls
+	state.mu.Unlock()
+	if afterFirst != 1 {
+		t.Fatalf("expected 1 teardown on the first sweep, got %d", afterFirst)
+	}
+
+	// Immediately re-run: still inside the backoff window.
+	state.healthy.Store(false)
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	afterSecond := state.unstageCalls
+	state.mu.Unlock()
+	if afterSecond != afterFirst {
+		t.Errorf("second sweep inside the backoff window must not recover again, got %d teardowns", afterSecond)
+	}
+
+	// Advance past the window; recovery is allowed again.
+	now = now.Add(recoveryBackoffBase + time.Second)
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	afterThird := state.unstageCalls
+	state.mu.Unlock()
+	if afterThird <= afterSecond {
+		t.Errorf("recovery must resume after the backoff window expires, got %d teardowns", afterThird)
+	}
+}
+
+// The window doubles, and a volume observed healthy again starts clean.
+func TestRecoveryBackoffGrowsAndResets(t *testing.T) {
+	ns := &NodeServer{}
+	now := time.Now()
+	ns.nowFn = func() time.Time { return now }
+
+	ns.noteRecoveryAttempt("v")
+	if !ns.recoveryThrottled("v") {
+		t.Fatal("expected throttle after the first attempt")
+	}
+
+	now = now.Add(recoveryBackoffBase + time.Second)
+	if ns.recoveryThrottled("v") {
+		t.Fatal("expected the first window to have expired")
+	}
+
+	ns.noteRecoveryAttempt("v")
+	now = now.Add(recoveryBackoffBase + time.Second)
+	if !ns.recoveryThrottled("v") {
+		t.Error("expected the second window to be longer than the first")
+	}
+
+	ns.resetRecoveryBackoff("v")
+	if ns.recoveryThrottled("v") {
+		t.Error("expected reset to clear the throttle")
 	}
 }

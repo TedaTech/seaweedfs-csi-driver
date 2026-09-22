@@ -41,6 +41,7 @@ func NewNodeServer(n *SeaweedFsDriver) *NodeServer {
 		},
 		nodeLabelsFn:     k8s.GetNodeLabels,
 		isHealthyFn:      isStagingPathHealthy,
+		isCorruptedFn:    isStagingPathCorrupted,
 		cleanupStagingFn: cleanupStaleStagingPath,
 		unmountFn:        mountutil.Unmount,
 		bindMountFn:      defaultBindMount,

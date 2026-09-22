@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/mountmanager"
@@ -27,6 +28,10 @@ type CapacityFn func(volumeID string) (int64, error)
 // BindMountFn performs a bind mount of source onto target, optionally
 // read-only. Used by Volume.Publish and overridden in tests.
 type BindMountFn func(source, target string, readOnly bool) error
+
+// CorruptionCheckFn reports whether a staging path's FUSE daemon is provably
+// dead (ENOTCONN and friends), as opposed to merely slow to answer.
+type CorruptionCheckFn func(stagingPath string) bool
 
 // HealthCheckFn reports whether a staging path has a live, responsive FUSE
 // mount. Overridden in tests to simulate a crashed mount.
@@ -60,15 +65,22 @@ type NodeServer struct {
 	// from piling up new recovery goroutines on top of a hung one.
 	activeRecoveries sync.Map // map[string]struct{}
 
+	// recoveryBackoff throttles repeated recoveries of the same volume.
+	// Tearing a mount down is node-wide and disruptive, so a volume that
+	// keeps failing its probe must not be torn down in a tight loop.
+	recoveryBackoff sync.Map // map[string]recoveryBackoffState
+
 	// Injectable factories / operations (overridden in tests).
 	mounterFactory   MounterFactory
 	capacityFn       CapacityFn
 	isHealthyFn      HealthCheckFn
+	isCorruptedFn    CorruptionCheckFn
 	cleanupStagingFn func(stagingPath string) error
 	unmountFn        func(path string) error
 	bindMountFn      BindMountFn
 	statfsFn         StatfsFn
 	nodeLabelsFn     NodeLabelsFn
+	nowFn            func() time.Time
 
 	// vacLoader reads the persisted VolumeAttributesClass parameters for a
 	// volume. Nil means the default filer-backed store.

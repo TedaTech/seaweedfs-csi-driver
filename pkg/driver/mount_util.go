@@ -75,6 +75,25 @@ func isStagingPathHealthy(stagingPath string) bool {
 	return true
 }
 
+// isStagingPathCorrupted reports whether the staging path's FUSE daemon is
+// provably gone — ENOTCONN and friends, what mount.IsCorruptedMnt matches.
+//
+// This is deliberately NOT the negation of isStagingPathHealthy. That
+// function answers "should I trust this mount", and returns false for a
+// mount that is merely slow to respond. Tearing a mount down is a
+// destructive, node-wide act: it kills the weed mount process every
+// consumer pod on the node shares, so every bind mount derived from it
+// dies at once. Only a provably dead daemon justifies it.
+func isStagingPathCorrupted(stagingPath string) bool {
+	if _, err := os.Stat(stagingPath); err != nil {
+		return mount.IsCorruptedMnt(err)
+	}
+	if _, err := mountutil.IsMountPoint(stagingPath); err != nil {
+		return mount.IsCorruptedMnt(err)
+	}
+	return false
+}
+
 // cleanupCorruptedStagingPath force-cleans a staging path whose FUSE
 // daemon is already dead (ENOTCONN / IsCorruptedMnt). Safe because the
 // kernel will reject reads/writes through a corrupted mount, so cleanup
