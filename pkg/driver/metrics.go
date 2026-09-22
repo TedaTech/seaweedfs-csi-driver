@@ -8,23 +8,23 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
-// Health-probe outcomes. The distinction between timeout and corrupted is the
-// point of this metric: a probe that did not answer in time says nothing about
-// whether the FUSE daemon is alive, while corrupted means it is provably dead.
-// Treating the first as the second is what tore down live mounts.
+// Health-probe outcomes. The distinction between a slow probe and a dead mount
+// is the point of this metric: a probe that did not answer in time says nothing
+// about whether the FUSE session is alive, while 'dead' means it is gone or
+// corrupted. Treating the first as the second is what tore down live mounts.
 const (
 	probeHealthy   = "healthy"
 	probeTimeout   = "timeout"
-	probeCorrupted = "corrupted"
-	probeUnmounted = "unmounted"
+	probeUnhealthy = "unhealthy"
+	probeDead      = "dead"
 )
 
 // Recovery outcomes.
 const (
-	recoveryOutcomeSuccess             = "success"
-	recoveryOutcomeFailed              = "failed"
-	recoveryOutcomeSkippedNotCorrupted = "skipped_not_corrupted"
-	recoveryOutcomeThrottled           = "throttled"
+	recoveryOutcomeSuccess          = "success"
+	recoveryOutcomeFailed           = "failed"
+	recoveryOutcomeSkippedStillLive = "skipped_still_live"
+	recoveryOutcomeThrottled        = "throttled"
 )
 
 // metricsRegistry is private rather than the global default so the endpoint
@@ -36,7 +36,7 @@ var (
 	mountHealthCheckTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "seaweedfs_csi",
 		Name:      "mount_health_check_total",
-		Help:      "Staging-mount health probes by outcome (healthy, timeout, corrupted, unmounted).",
+		Help:      "Staging-mount health probes by outcome (healthy, timeout, unhealthy, dead).",
 	}, []string{"volume", "result"})
 
 	mountRecoveryTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -48,7 +48,7 @@ var (
 	mountSessionUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "seaweedfs_csi",
 		Name:      "mount_session_up",
-		Help:      "1 while the volume's FUSE session is believed alive, 0 once a probe proves it corrupted.",
+		Help:      "1 while the volume's FUSE session is a live mount, 0 once it is gone or corrupted.",
 	}, []string{"volume"})
 )
 

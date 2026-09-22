@@ -75,23 +75,31 @@ func isStagingPathHealthy(stagingPath string) bool {
 	return true
 }
 
-// isStagingPathCorrupted reports whether the staging path's FUSE daemon is
-// provably gone — ENOTCONN and friends, what mount.IsCorruptedMnt matches.
+// isStagingPathLive reports whether the staging path is still a working FUSE
+// mount: it exists, it is a mount point, and the daemon answers a GETATTR on
+// the root inode.
 //
-// This is deliberately NOT the negation of isStagingPathHealthy. That
-// function answers "should I trust this mount", and returns false for a
-// mount that is merely slow to respond. Tearing a mount down is a
-// destructive, node-wide act: it kills the weed mount process every
-// consumer pod on the node shares, so every bind mount derived from it
-// dies at once. Only a provably dead daemon justifies it.
-func isStagingPathCorrupted(stagingPath string) bool {
+// This is the predicate that gates teardown, and it is deliberately NOT the
+// negation of isStagingPathHealthy. That function answers "should I trust this
+// mount" and says no for a mount that was merely slow to respond. Stopping a
+// weed mount process is node-wide and destructive — every consumer pod shares
+// it, so every bind mount derived from it dies at once. Only do that when the
+// mount is demonstrably no longer live.
+//
+// Both checks are O(1) in directory size (upstream ab458aa), so unlike the
+// ReadDir probe this cannot time out merely because a bucket root is large.
+func isStagingPathLive(stagingPath string) bool {
 	if _, err := os.Stat(stagingPath); err != nil {
-		return mount.IsCorruptedMnt(err)
+		// ENOENT (the mount was torn down when weed mount exited) or
+		// ENOTCONN (the daemon died under it). Either way, not live.
+		return false
 	}
-	if _, err := mountutil.IsMountPoint(stagingPath); err != nil {
-		return mount.IsCorruptedMnt(err)
+
+	isMnt, err := mountutil.IsMountPoint(stagingPath)
+	if err != nil {
+		return false
 	}
-	return false
+	return isMnt
 }
 
 // cleanupCorruptedStagingPath force-cleans a staging path whose FUSE

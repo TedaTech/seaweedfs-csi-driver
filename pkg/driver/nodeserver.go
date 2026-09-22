@@ -29,9 +29,9 @@ type CapacityFn func(volumeID string) (int64, error)
 // read-only. Used by Volume.Publish and overridden in tests.
 type BindMountFn func(source, target string, readOnly bool) error
 
-// CorruptionCheckFn reports whether a staging path's FUSE daemon is provably
-// dead (ENOTCONN and friends), as opposed to merely slow to answer.
-type CorruptionCheckFn func(stagingPath string) bool
+// LivenessCheckFn reports whether a staging path is still a working FUSE
+// mount, as opposed to one that is merely slow to answer.
+type LivenessCheckFn func(stagingPath string) bool
 
 // HealthCheckFn reports whether a staging path has a live, responsive FUSE
 // mount. Overridden in tests to simulate a crashed mount.
@@ -74,7 +74,7 @@ type NodeServer struct {
 	mounterFactory   MounterFactory
 	capacityFn       CapacityFn
 	isHealthyFn      HealthCheckFn
-	isCorruptedFn    CorruptionCheckFn
+	isLiveFn         LivenessCheckFn
 	cleanupStagingFn func(stagingPath string) error
 	unmountFn        func(path string) error
 	bindMountFn      BindMountFn

@@ -34,14 +34,28 @@ type recoveryBackoffState struct {
 	notBefore time.Time
 }
 
-// corrupted reports whether the staging path's FUSE daemon is provably dead.
-// A nil hook falls back to the real check — this gates a destructive action,
-// so an unset field must not quietly disable it.
-func (ns *NodeServer) corrupted(stagingPath string) bool {
-	if ns.isCorruptedFn != nil {
-		return ns.isCorruptedFn(stagingPath)
+// live reports whether the staging path is still a working FUSE mount, under
+// the same time budget as the health probe: both of its syscalls are O(1) in
+// directory size, so exceeding the budget means the daemon is wedged rather
+// than merely busy.
+//
+// A nil hook falls back to the real check. This gates a destructive action, so
+// an unset field must not quietly disable it.
+func (ns *NodeServer) live(stagingPath string) bool {
+	alive, err := runWithTimeout(
+		defaultHealthCheckTimeout,
+		fmt.Sprintf("health monitor: liveness check for %s", stagingPath),
+		func() (bool, error) {
+			if ns.isLiveFn != nil {
+				return ns.isLiveFn(stagingPath), nil
+			}
+			return isStagingPathLive(stagingPath), nil
+		},
+	)
+	if err != nil {
+		return false
 	}
-	return isStagingPathCorrupted(stagingPath)
+	return alive
 }
 
 func (ns *NodeServer) now() time.Time {
@@ -152,17 +166,18 @@ func (ns *NodeServer) probeStaging(volumeID, path string) bool {
 		return true
 	}
 
-	if ns.corrupted(path) {
-		recordHealthProbe(volumeID, probeCorrupted)
+	if !ns.live(path) {
+		// Gone or corrupted: the FUSE session is over.
+		recordHealthProbe(volumeID, probeDead)
 		setSessionUp(volumeID, false)
 		return false
 	}
 
-	// Not corrupted: the daemon is still there as far as we can prove.
+	// Still a live mount: the probe's verdict says nothing worse than slow.
 	if timedOut {
 		recordHealthProbe(volumeID, probeTimeout)
 	} else {
-		recordHealthProbe(volumeID, probeUnmounted)
+		recordHealthProbe(volumeID, probeUnhealthy)
 	}
 	setSessionUp(volumeID, true)
 	return false
@@ -390,17 +405,22 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 		}
 	}
 
-	// A slow probe is not authority to destroy a live FUSE session.
+	// A slow probe is not authority to destroy a working FUSE session.
 	// checkHealth reports unhealthy for a mount that merely missed its
-	// timeout budget, and recovery below stops the weed mount process
-	// that every consumer pod on this node shares — killing their bind
-	// mounts and any writes in flight. Only act when the daemon is
-	// provably dead, or when nothing is published against it and the
-	// blast radius is therefore empty.
-	if len(publishes) > 0 && !ns.corrupted(stagingPath) {
+	// time budget, and recovery below stops the weed mount process that
+	// every consumer pod on this node shares — killing their bind mounts
+	// and any writes in flight. Re-check the one thing that actually
+	// justifies that: is the staging path still a live mount?
+	//
+	// A mount that is gone (weed mount exited and its wait() unmounted the
+	// staging path) or corrupted (ENOTCONN) is not live, and recovery
+	// proceeds — that is the seaweedfs-csi-driver#261 case this exists to
+	// fix. Only a still-live mount is protected, and only while something
+	// is published against it and the blast radius is real.
+	if len(publishes) > 0 && ns.live(stagingPath) {
 		ns.noteRecoveryAttempt(volumeID)
-		recordRecovery(volumeID, recoveryOutcomeSkippedNotCorrupted)
-		glog.Warningf("health monitor: volume %s failed its health probe but the FUSE daemon at %s is not corrupted and %d publish path(s) are live; skipping recovery", volumeID, stagingPath, len(publishes))
+		recordRecovery(volumeID, recoveryOutcomeSkippedStillLive)
+		glog.Warningf("health monitor: volume %s failed its health probe but %s is still a live mount with %d publish path(s); skipping recovery rather than tearing down a working FUSE session", volumeID, stagingPath, len(publishes))
 		return
 	}
 

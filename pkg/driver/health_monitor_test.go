@@ -112,8 +112,10 @@ func newNodeServerWithFakes(t *testing.T, state *fakeMountState) *NodeServer {
 		isHealthyFn: func(path string) bool {
 			return state.isHealthy(path)
 		},
-		isCorruptedFn: func(path string) bool {
-			return !state.isHealthy(path)
+		// In the fake world an unhealthy mount is a dead one: the tests
+		// that drive recovery are simulating a crashed FUSE daemon.
+		isLiveFn: func(path string) bool {
+			return state.isHealthy(path)
 		},
 		cleanupStagingFn: func(path string) error {
 			state.mu.Lock()
@@ -547,11 +549,11 @@ func stageAndPublish(t *testing.T, ns *NodeServer, state *fakeMountState, volume
 // mount root outran the 5s health-check budget, the monitor called the mount
 // unhealthy, and recovery killed the weed mount process every pod on the node
 // shared.
-func TestHealthMonitorSkipsRecoveryWhenMountIsNotCorrupted(t *testing.T) {
+func TestHealthMonitorSkipsRecoveryWhenMountIsStillLive(t *testing.T) {
 	state := newFakeMountState()
 	ns := newNodeServerWithFakes(t, state)
-	// Probe fails (slow), but the FUSE daemon is alive.
-	ns.isCorruptedFn = func(string) bool { return false }
+	// Probe fails (slow), but the mount is still live.
+	ns.isLiveFn = func(string) bool { return true }
 
 	_, _ = stageAndPublish(t, ns, state, "vol-slow")
 	state.healthy.Store(false)
@@ -573,11 +575,11 @@ func TestHealthMonitorSkipsRecoveryWhenMountIsNotCorrupted(t *testing.T) {
 	}
 }
 
-// The counterpart: a provably dead daemon still recovers exactly as before.
-func TestHealthMonitorRecoversWhenMountIsCorrupted(t *testing.T) {
+// The counterpart: a mount that is no longer live still recovers as before.
+func TestHealthMonitorRecoversWhenMountIsNotLive(t *testing.T) {
 	state := newFakeMountState()
 	ns := newNodeServerWithFakes(t, state)
-	ns.isCorruptedFn = func(string) bool { return true }
+	ns.isLiveFn = func(string) bool { return false }
 
 	_, _ = stageAndPublish(t, ns, state, "vol-dead")
 	state.healthy.Store(false)
@@ -601,7 +603,7 @@ func TestHealthMonitorRecoversWhenMountIsCorrupted(t *testing.T) {
 func TestHealthMonitorRecoversUnpublishedVolumeWithoutCorruption(t *testing.T) {
 	state := newFakeMountState()
 	ns := newNodeServerWithFakes(t, state)
-	ns.isCorruptedFn = func(string) bool { return false }
+	ns.isLiveFn = func(string) bool { return true }
 
 	root := t.TempDir()
 	stagingPath := filepath.Join(root, "staging")
@@ -633,7 +635,7 @@ func TestHealthMonitorRecoversUnpublishedVolumeWithoutCorruption(t *testing.T) {
 func TestHealthMonitorBacksOffRepeatedRecoveries(t *testing.T) {
 	state := newFakeMountState()
 	ns := newNodeServerWithFakes(t, state)
-	ns.isCorruptedFn = func(string) bool { return true }
+	ns.isLiveFn = func(string) bool { return false }
 
 	now := time.Now()
 	ns.nowFn = func() time.Time { return now }
@@ -701,5 +703,57 @@ func TestRecoveryBackoffGrowsAndResets(t *testing.T) {
 	ns.resetRecoveryBackoff("v")
 	if ns.recoveryThrottled("v") {
 		t.Error("expected reset to clear the throttle")
+	}
+}
+
+// seaweedfs-csi-driver#261: when a weed mount process exits on its own, its
+// wait() handler unmounts the staging path, so by the time the sweep notices
+// the path is simply GONE — not ENOTCONN. Recovery must still run, or the pod
+// is left with a dead FUSE and "transport endpoint is not connected".
+//
+// This uses the real liveness predicate rather than a stub: an earlier version
+// of the guard tested for corruption only, returned false for a vanished
+// mount, and silently disabled recovery for exactly this case.
+func TestHealthMonitorRecoversWhenStagingPathVanished(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+	// No isLiveFn: exercise isStagingPathLive itself.
+	ns.isLiveFn = nil
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	publishPath := filepath.Join(root, "pod", "mount")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume("vol-vanished", stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	ns.volumes.Store("vol-vanished", vol)
+
+	if err := vol.Publish(stagingPath, publishPath, false); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	vol.AddPublishPath(publishPath, false)
+
+	// weed mount exits and its wait() unmounts and removes the staging path.
+	state.healthy.Store(false)
+	if err := os.RemoveAll(stagingPath); err != nil {
+		t.Fatalf("remove staging path: %v", err)
+	}
+
+	if isStagingPathLive(stagingPath) {
+		t.Fatal("test setup invalid: a removed staging path must not be live")
+	}
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.stageCalls != 2 {
+		t.Errorf("expected recovery to re-stage a vanished mount, got %d stage calls", state.stageCalls)
 	}
 }
