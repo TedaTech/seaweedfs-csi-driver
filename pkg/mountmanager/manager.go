@@ -18,6 +18,8 @@ import (
 
 var kubeMounter = mount.New("")
 
+var lazyUnmount = LazyUnmount
+
 // Manager owns weed mount processes and exposes helpers to start and stop them.
 type Manager struct {
 	weedBinary string
@@ -224,7 +226,10 @@ func ensureTargetClean(targetPath string) error {
 		} else if mount.IsCorruptedMnt(err) {
 			glog.Warningf("Target path %s is a corrupted mount, attempting to unmount", targetPath)
 			if unmountErr := kubeMounter.Unmount(targetPath); unmountErr != nil {
-				return fmt.Errorf("failed to unmount corrupted mount %s: %w", targetPath, unmountErr)
+				glog.Warningf("unmount corrupted mount %s failed: %v; trying lazy unmount", targetPath, unmountErr)
+				if lazyErr := lazyUnmount(targetPath); lazyErr != nil {
+					return fmt.Errorf("failed to unmount corrupted mount %s: regular unmount: %v; lazy unmount: %w", targetPath, unmountErr, lazyErr)
+				}
 			}
 		} else {
 			return err
@@ -334,7 +339,12 @@ func (p *weedMountProcess) wait() {
 
 	// Brief delay to allow FUSE cleanup and pending I/O to complete before unmounting
 	time.Sleep(100 * time.Millisecond)
-	_ = kubeMounter.Unmount(p.target)
+	if err := kubeMounter.Unmount(p.target); err != nil {
+		glog.Warningf("umount %s after weed mount exit failed: %v; trying lazy unmount", p.target, err)
+		if lazyErr := lazyUnmount(p.target); lazyErr != nil {
+			glog.Warningf("lazy unmount %s after weed mount exit failed: %v", p.target, lazyErr)
+		}
+	}
 
 	close(p.done)
 }

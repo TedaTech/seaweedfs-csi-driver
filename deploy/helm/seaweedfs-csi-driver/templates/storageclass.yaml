@@ -10,4 +10,10 @@ metadata:
 provisioner: {{ .Values.driverName }}
 allowVolumeExpansion: true
 volumeBindingMode: {{ .Values.storageClassVolumeBindingMode | default "Immediate" }}
+{{- with .Values.storageClassParameters }}
+parameters:
+  {{- range $key, $value := . }}
+  {{ $key }}: {{ $value | toString | quote }}
+  {{- end }}
+{{- end }}
 {{- end }}

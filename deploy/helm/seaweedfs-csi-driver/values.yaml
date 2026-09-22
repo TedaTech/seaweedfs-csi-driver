@@ -2,6 +2,10 @@
 seaweedfsFiler: "SEAWEEDFS_FILER:8888"
 storageClassName: seaweedfs-storage
 storageClassVolumeBindingMode: Immediate
+# parameters for the storage class created by the chart. Example:
+# storageClassParameters:
+#   volumeServerAccess: "filerProxy"
+storageClassParameters: {}
 isDefaultStorageClass: false
 tlsSecret: ""
 #logVerbosity: 4
@@ -10,6 +14,14 @@ tlsSecret: ""
 
 #concurrentWriters: 128
 #concurrentReaders: 128
+
+# Extra flags appended to every weed mount command. Arguments managed by the
+# CSI driver, such as -dir and -filer, cannot be overridden here.
+mountExtraArgs: []
+#  - -debug
+#  - -debug.port=6062
+#  - -readerCacheSizeMB=256
+#  - -memoryLimitMB=768
 
 # Security configuration for SeaweedFS security.toml
 # Mounts security.toml to /etc/seaweedfs/security.toml in seaweedfs-mount
@@ -133,8 +145,15 @@ mountService:
 
 driverName: seaweedfs-csi-driver
 
+# Node label keys reported as the accessible topology of each node, e.g.
+# ["topology.kubernetes.io/zone"]. When set, CSINode gets topologyKeys, so
+# StorageClass allowedTopologies is honoured and pods with SeaweedFS PVCs are
+# only scheduled on nodes running this driver.
+topologyKeys: []
+
 controller:
   replicas: 1
+  nodeSelector: {}
   affinity: {}
   tolerations:
   resources: {}
@@ -170,6 +189,7 @@ node:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 25%
+  nodeSelector: {}
   affinity: {}
   tolerations:
   livenessProbe:
