@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -17,21 +18,24 @@ var (
 	enableAttacher = flag.Bool("attacher", true, "enable attacher, by default enabled for backward compatibility")
 	driverName     = flag.String("driverName", "seaweedfs-csi-driver", "CSI driver name, used by CSIDriver and StorageClass")
 
-	filer             = flag.String("filer", "localhost:8888", "filer server")
-	endpoint          = flag.String("endpoint", "unix://tmp/seaweedfs-csi.sock", "CSI endpoint to accept gRPC calls")
-	mountEndpoint     = flag.String("mountEndpoint", "unix:///tmp/seaweedfs-mount.sock", "mount service endpoint")
-	nodeID            = flag.String("nodeid", "", "node id")
-	version           = flag.Bool("version", false, "Print the version and exit.")
-	concurrentWriters = flag.Int("concurrentWriters", 128, "limit concurrent goroutine writers if not 0")
-	concurrentReaders = flag.Int("concurrentReaders", 128, "limit concurrent chunk fetches for read operations")
-	cacheCapacityMB   = flag.Int("cacheCapacityMB", 0, "local file chunk cache capacity in MB")
-	cacheMetaTtlSec   = flag.Int("cacheMetaTtlSec", 60, "metadata cache TTL in seconds")
-	cacheDir          = flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
-	uidMap            = flag.String("map.uid", "", "map local uid to uid on filer, comma-separated <local_uid>:<filer_uid>")
-	gidMap            = flag.String("map.gid", "", "map local gid to gid on filer, comma-separated <local_gid>:<filer_gid>")
-	dataCenter        = flag.String("dataCenter", "", "dataCenter this node is running in (locality-definition)")
-	dataLocalityStr   = flag.String("dataLocality", "", "which volume-nodes pods will use for activity (one-of: 'write_preferLocalDc'). Requires used locality-definitions to be set")
-	dataLocality      datalocality.DataLocality
+	filer                = flag.String("filer", "localhost:8888", "filer server")
+	endpoint             = flag.String("endpoint", "unix://tmp/seaweedfs-csi.sock", "CSI endpoint to accept gRPC calls")
+	mountEndpoint        = flag.String("mountEndpoint", "unix:///tmp/seaweedfs-mount.sock", "mount service endpoint")
+	nodeID               = flag.String("nodeid", "", "node id")
+	version              = flag.Bool("version", false, "Print the version and exit.")
+	concurrentWriters    = flag.Int("concurrentWriters", 128, "limit concurrent goroutine writers if not 0")
+	mountExtraArgs       = flag.String("mountExtraArgs", "[]", "JSON array of extra weed mount flags, using -name=value or boolean -name")
+	concurrentReaders    = flag.Int("concurrentReaders", 128, "limit concurrent chunk fetches for read operations")
+	cacheCapacityMB      = flag.Int("cacheCapacityMB", 0, "local file chunk cache capacity in MB")
+	cacheMetaTtlSec      = flag.Int("cacheMetaTtlSec", 60, "metadata cache TTL in seconds")
+	cacheDir             = flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
+	uidMap               = flag.String("map.uid", "", "map local uid to uid on filer, comma-separated <local_uid>:<filer_uid>")
+	gidMap               = flag.String("map.gid", "", "map local gid to gid on filer, comma-separated <local_gid>:<filer_gid>")
+	dataCenter           = flag.String("dataCenter", "", "dataCenter this node is running in (locality-definition)")
+	dataLocalityStr      = flag.String("dataLocality", "", "which volume-nodes pods will use for activity (one-of: 'write_preferLocalDc'). Requires used locality-definitions to be set")
+	topologyKeys         = flag.String("topologyKeys", "", "comma-separated node label keys reported as accessible topology, e.g. topology.kubernetes.io/zone")
+	dataLocality         datalocality.DataLocality
+	parsedMountExtraArgs []string
 )
 
 func main() {
@@ -88,6 +92,7 @@ func main() {
 
 	drv.ConcurrentWriters = *concurrentWriters
 	drv.ConcurrentReaders = *concurrentReaders
+	drv.MountExtraArgs = parsedMountExtraArgs
 	drv.CacheCapacityMB = *cacheCapacityMB
 	drv.CacheMetaTtlSec = *cacheMetaTtlSec
 	drv.CacheDir = *cacheDir
@@ -95,11 +100,19 @@ func main() {
 	drv.GidMap = *gidMap
 	drv.DataCenter = *dataCenter
 	drv.DataLocality = dataLocality
+	drv.TopologyKeys = driver.ParseTopologyKeys(*topologyKeys)
 
 	drv.Run()
 }
 
 func convertRequiredValues() error {
+	if err := json.Unmarshal([]byte(*mountExtraArgs), &parsedMountExtraArgs); err != nil {
+		return fmt.Errorf("invalid mountExtraArgs: %w", err)
+	}
+	if err := driver.ValidateMountArgs(parsedMountExtraArgs); err != nil {
+		return err
+	}
+
 	// Convert DataLocalityStr to DataLocality
 	if *dataLocalityStr != "" {
 		var ok bool

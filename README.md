@@ -16,6 +16,7 @@
 - [Testing](#testing)
 - [Static and dynamic provisioning](#static-and-dynamic-provisioning)
 - [DataLocality](#datalocality)
+- [Node topology](#node-topology)
 - [License](#license)
 - [Code of conduct](#code-of-conduct)
 
@@ -226,6 +227,52 @@ spec:
       storage: 1Gi
 ```
 
+# VolumeAttributesClass
+
+Mount-time parameters can be changed on a **bound** PVC through
+[VolumeAttributesClass](https://kubernetes.io/docs/concepts/storage/volume-attributes-classes/),
+without recreating the volume:
+
+```
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: seaweedfs-ssd
+driverName: seaweedfs-csi-driver
+parameters:
+  diskType: "ssd"
+  concurrentReaders: "64"
+```
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  volumeAttributesClassName: seaweedfs-ssd
+  ...
+```
+
+Modifiable parameters are the mount-time knobs: `diskType`, `replication`,
+`ttl`, `dataCenter`, `dataLocality`, `uidMap`, `gidMap`, `chunkSizeLimitMB`,
+`volumeServerAccess`, `readRetryTime`, `concurrentReaders`,
+`concurrentWriters`, `cacheCapacityMB`, `cacheMetaTtlSec`. Structural keys
+(`collection`, `path`, `parentDir`, `volumeName`, capacity) are rejected, as
+are invalid values (unknown `dataLocality`, non-integer numeric options).
+
+Notes:
+
+- A class applied when the PVC is created reaches the first mount directly.
+  Changing the class of a bound PVC persists the accepted parameters on the
+  filer (under `/.csi/vac/<volume>`, outside `/buckets`); the volume picks
+  them up at its next stage (pod restart or reschedule).
+- The entry is removed with the volume on `DeleteVolume`.
+- The cluster's `csi-resizer` must support VolumeAttributesClass against the
+  k8s API version in use: released v1.14.0 still watches the
+  `storage.k8s.io/v1beta1` API removed in Kubernetes 1.34 — use a build from
+  master (or a newer release once available).
+
 # DataLocality
 
 DataLocality (inspired by [Longhorn](https://longhorn.io/docs/latest/high-availability/data-locality/)) allows instructing the storage-driver which volume-locations will be used or preferred in Pods to read & write.
@@ -271,6 +318,31 @@ You can activate it in the Helm-Chart `values.yaml` -> `node.injectTopologyInfoF
 `node.injectTopologyInfoFromNodeLabel.labels` decides which labels are grabbed from the node.
 
 It is recommended to use [well-known labels](https://kubernetes.io/docs/reference/labels-annotations-taints/#topologykubernetesioregion) to avoid confusion.
+
+# Node topology
+
+When the driver only runs on some nodes, report the labels of those nodes as accessible topology. `CSINode.spec.drivers[].topologyKeys` then gets populated, provisioned PVs get a matching `nodeAffinity` and the scheduler stops placing pods with SeaweedFS PVCs on nodes without the driver.
+
+Level               | Location
+------------------- | --------
+Driver              | Helm: `values.yaml` -> `topologyKeys` <br> Or args `--topologyKeys=` on Container `csi-seaweedfs-plugin` (`DaemonSet`) and Container `seaweedfs-csi-plugin` (`Deployment`)
+
+```yaml
+topologyKeys:
+  - topology.kubernetes.io/zone
+```
+
+Every key is looked up in the labels of the node the driver runs on; keys the node does not have are skipped. The CSI spec asks for a single key prefix across all topology keys, so prefer keys such as `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` together. A StorageClass can then restrict where volumes are provisioned:
+
+```yaml
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.kubernetes.io/zone
+        values:
+          - zone-a
+```
+
+The node ServiceAccount needs `get` on `nodes`, which the Helm chart already grants.
 
 # License
 [Apache v2 license](https://www.apache.org/licenses/LICENSE-2.0)

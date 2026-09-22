@@ -34,6 +34,19 @@ And running:
 helm install my-seaweedfs-csi-driver seaweedfs-csi-driver/seaweedfs-csi-driver -f seaweedfs-overrides.yaml
 ```
 
+Additional `weed mount` flags can be passed to every volume:
+
+```yaml
+mountExtraArgs:
+  - -debug
+  - -debug.port=6062
+  - -readerCacheSizeMB=256
+  - -memoryLimitMB=768
+```
+
+Arguments managed by the CSI driver, including `-dir`, `-filer`, and
+`-localSocket`, cannot be overridden.
+
 ## Usage
 
 See [Testing](https://github.com/seaweedfs/seaweedfs-csi-driver#testing) on some usage examples.

@@ -33,6 +33,9 @@ spec:
       {{- end }}
       #hostNetwork: true
       #dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.node.affinity }}
       affinity: {{ toYaml . | nindent 8 }}
       {{- end }}
@@ -60,12 +63,18 @@ spec:
             {{- if .Values.node.injectTopologyInfoFromNodeLabel.enabled }}
             - --dataCenter=$(DATACENTER)
             {{- end }}
+            {{- with .Values.topologyKeys }}
+            - --topologyKeys={{ join "," . }}
+            {{- end }}
             - --components=node
             {{- with .Values.concurrentWriters }}
             - --concurrentWriters={{ . }}
             {{- end }}
             {{- with .Values.concurrentReaders }}
             - --concurrentReaders={{ . }}
+            {{- end }}
+            {{- with .Values.mountExtraArgs }}
+            - {{ printf "--mountExtraArgs=%s" (toJson .) | quote }}
             {{- end }}
             {{- with .Values.cacheCapacityMB }}
             - --cacheCapacityMB={{ . }}

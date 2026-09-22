@@ -39,6 +39,7 @@ func NewNodeServer(n *SeaweedFsDriver) *NodeServer {
 		capacityFn: func(volumeID string) (int64, error) {
 			return k8s.GetVolumeCapacity(n.name, volumeID)
 		},
+		nodeLabelsFn:     k8s.GetNodeLabels,
 		isHealthyFn:      isStagingPathHealthy,
 		cleanupStagingFn: cleanupStaleStagingPath,
 		unmountFn:        mountutil.Unmount,
@@ -184,6 +185,32 @@ func (km *KeyMutex) GetMutex(key string) *sync.Mutex {
 
 func (km *KeyMutex) RemoveMutex(key string) {
 	km.mutexes.Delete(key)
+}
+
+// ParseTopologyKeys splits a comma-separated list of node label keys.
+func ParseTopologyKeys(keys string) []string {
+	var parsed []string
+	prefixes := make(map[string]struct{})
+	for _, key := range strings.Split(keys, ",") {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		parsed = append(parsed, key)
+		prefix, _, found := strings.Cut(key, "/")
+		if !found {
+			prefix = ""
+		}
+		prefixes[prefix] = struct{}{}
+	}
+
+	// The CSI spec wants one identical prefix across all topology keys. Kubernetes
+	// accepts more than one, so warn instead of refusing to start.
+	if len(prefixes) > 1 {
+		glog.Warningf("topology keys %v do not share a single key prefix, which the CSI spec asks for", parsed)
+	}
+
+	return parsed
 }
 
 func CheckDataLocality(dataLocality *datalocality.DataLocality, dataCenter *string) error {

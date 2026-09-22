@@ -103,6 +103,10 @@ func (u *mountServiceUnmounter) Unmount() error {
 }
 
 func (m *mountServiceMounter) buildMountArgs(targetPath, cacheDir, localSocket string, filers []string) ([]string, error) {
+	if err := ValidateMountArgs(m.driver.MountExtraArgs); err != nil {
+		return nil, err
+	}
+
 	volumeContext := m.volContext
 	if volumeContext == nil {
 		volumeContext = map[string]string{}
@@ -177,6 +181,9 @@ func (m *mountServiceMounter) buildMountArgs(targetPath, cacheDir, localSocket s
 	}
 
 	dataCenter := m.driver.DataCenter
+	if contextDataCenter, ok := volumeContext["dataCenter"]; ok && contextDataCenter != "" {
+		dataCenter = contextDataCenter
+	}
 	if err := CheckDataLocality(&dataLocality, &dataCenter); err != nil {
 		return nil, err
 	}
@@ -224,7 +231,7 @@ func (m *mountServiceMounter) buildMountArgs(targetPath, cacheDir, localSocket s
 		args = append(args, fmt.Sprintf("-%s=%s", key, value))
 	}
 
-	return args, nil
+	return append(args, m.driver.MountExtraArgs...), nil
 }
 
 func initialCollectionQuotaMB(capacityBytes string) string {
@@ -239,4 +246,18 @@ func initialCollectionQuotaMB(capacityBytes string) string {
 		capacityMB++
 	}
 	return strconv.FormatInt(capacityMB, 10)
+}
+
+func ValidateMountArgs(args []string) error {
+	for _, arg := range args {
+		name, _, _ := strings.Cut(strings.TrimPrefix(arg, "-"), "=")
+		if !strings.HasPrefix(arg, "-") || name == "" || strings.HasPrefix(name, "-") || strings.ContainsAny(name, " \t\r\n") {
+			return fmt.Errorf("invalid mount argument %q: use -name=value or boolean -name", arg)
+		}
+		switch name {
+		case "dir", "dirAutoCreate", "localSocket", "cacheDir", "readOnly", "filer", "filer.path", "collection", "collectionQuotaMB":
+			return fmt.Errorf("mount argument %q is managed by the CSI driver", name)
+		}
+	}
+	return nil
 }

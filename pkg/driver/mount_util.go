@@ -6,11 +6,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/mountmanager"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"k8s.io/mount-utils"
 )
 
 var mountutil = mount.New("")
+
+var lazyUnmount = mountmanager.LazyUnmount
 
 // isStagingPathHealthy checks if the staging path has a healthy FUSE mount.
 // It returns true if the path is mounted and accessible, false otherwise.
@@ -53,13 +56,21 @@ func isStagingPathHealthy(stagingPath string) bool {
 		return false
 	}
 
-	// Try to read the directory to verify FUSE is responsive
-	_, err = os.ReadDir(stagingPath)
-	if err != nil {
-		glog.Warningf("staging path %s is not readable (FUSE may be dead): %v", stagingPath, err)
-		return false
-	}
-
+	// Deliberately not calling os.ReadDir(stagingPath) here. It used to be a
+	// "FUSE is responsive" probe, but ReadDir enumerates the *entire* root
+	// directory, and seaweedfs mount answers a readdir by fetching the whole
+	// listing from the filer before returning anything to the kernel — on a
+	// bucket with a large root this can legitimately take many minutes even
+	// though the mount is perfectly healthy. checkHealth's 5s timeout then
+	// marks it unhealthy and triggers a remount, which restarts that same
+	// slow listing from scratch: the mount can never finish enumerating and
+	// gets stuck in a permanent recovery loop.
+	//
+	// The os.Stat + IsMountPoint checks above already exercise a FUSE GETATTR
+	// round-trip on the root inode (cost independent of directory size) and
+	// already catch a dead/disconnected daemon via IsCorruptedMnt (ENOTCONN),
+	// which was the actual failure mode behind issue #261. That's sufficient
+	// liveness evidence without paying for a full directory scan.
 	glog.V(4).Infof("staging path %s is healthy", stagingPath)
 	return true
 }
@@ -70,8 +81,13 @@ func isStagingPathHealthy(stagingPath string) bool {
 // cannot propagate deletes through a live FUSE.
 func cleanupCorruptedStagingPath(stagingPath string) error {
 	if err := mount.CleanupMountPoint(stagingPath, mountutil, true); err != nil {
-		glog.Warningf("failed to cleanup corrupted mount point %s: %v", stagingPath, err)
-		return err
+		glog.Warningf("standard cleanup of corrupted staging path %s failed: %v; trying lazy unmount", stagingPath, err)
+		if lazyErr := lazyUnmount(stagingPath); lazyErr != nil {
+			return fmt.Errorf("cleanup corrupted mount %s: cleanup %v, lazy unmount %v", stagingPath, err, lazyErr)
+		}
+		if err := os.RemoveAll(stagingPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	glog.Infof("successfully cleaned up corrupted staging path %s", stagingPath)
 	return nil
