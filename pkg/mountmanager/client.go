@@ -62,6 +62,40 @@ func (c *Client) Unmount(req *UnmountRequest) (*UnmountResponse, error) {
 	return &resp, nil
 }
 
+// ErrListUnsupported is returned when the mount service predates /list. The
+// two images roll independently, so a new node plugin routinely meets an old
+// mount service; callers degrade to an empty volume map rather than failing.
+var ErrListUnsupported = errors.New("mount service does not support /list")
+
+// List returns the volumes the mount service currently owns.
+func (c *Client) List() (*ListResponse, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/list", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call mount service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, ErrListUnsupported
+	}
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("mount service error: %s (%s)", resp.Status, string(data))
+	}
+
+	var out ListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &out, nil
+}
+
 func (c *Client) doPost(path string, payload any, out any) error {
 	body := &bytes.Buffer{}
 	if err := json.NewEncoder(body).Encode(payload); err != nil {

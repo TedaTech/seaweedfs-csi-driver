@@ -50,6 +50,16 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mount", makePostHandler(manager.Mount))
 	mux.HandleFunc("/unmount", makePostHandler(manager.Unmount))
+	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(manager.List()); err != nil {
+			glog.Errorf("encoding list response: %v", err)
+		}
+	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

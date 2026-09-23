@@ -79,11 +79,13 @@ func (m *mountServiceMounter) Mount(target string) (Unmounter, error) {
 	}
 
 	req := &mountmanager.MountRequest{
-		VolumeID:    m.volumeID,
-		TargetPath:  target,
-		CacheDir:    cacheDir,
-		MountArgs:   args,
-		LocalSocket: localSocket,
+		VolumeID:      m.volumeID,
+		TargetPath:    target,
+		CacheDir:      cacheDir,
+		MountArgs:     args,
+		VolumeContext: m.volContext,
+		ReadOnly:      m.readOnly,
+		LocalSocket:   localSocket,
 	}
 
 	_, err = m.client.Mount(req)
@@ -95,6 +97,18 @@ func (m *mountServiceMounter) Mount(target string) (Unmounter, error) {
 		client:   m.client,
 		volumeID: m.volumeID,
 	}, nil
+}
+
+// newUnmounter builds an unmounter for a volume the mount service already
+// owns. Unlike the one Mount returns, this needs no mount to exist first,
+// which is what lets a restored volume be torn down through the manager
+// instead of leaving recovery to abort on a still-mounted staging path.
+func newUnmounter(driver *SeaweedFsDriver, volumeID string) (Unmounter, error) {
+	client, err := mountmanager.NewClient(driver.mountEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &mountServiceUnmounter{client: client, volumeID: volumeID}, nil
 }
 
 func (u *mountServiceUnmounter) Unmount() error {
