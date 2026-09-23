@@ -55,6 +55,37 @@ type filerVacStore struct {
 	client *http.Client
 }
 
+// errCorruptVacEntry marks a stored document that could not be decoded. It is
+// distinct from an availability failure: the entry exists and is wrong, which
+// is worth failing on, whereas an unreachable filer is not — see
+// NodeServer.loadPersistedVolumeAttributes.
+type errCorruptVacEntry struct {
+	volumeID string
+	err      error
+}
+
+func (e *errCorruptVacEntry) Error() string {
+	return fmt.Sprintf("corrupt persisted parameters for %s: %v", e.volumeID, e.err)
+}
+
+func (e *errCorruptVacEntry) Unwrap() error { return e.err }
+
+// vacFilersForVolume resolves the filers that hold a volume's persisted
+// attributes. The entry is written next to the volume, so it lives on the
+// volume's OWN filer — which, for a StorageClass that overrides the filer, is
+// not the driver's default.
+//
+// Reading it from the default filer looks for a tenant volume's attributes on
+// the wrong filer entirely. Because stageNewVolume reads this store, that made
+// every NodeStageVolume on a multi-filer cluster fail. Upstream assumes a
+// single filer and has no equivalent.
+func vacFilersForVolume(driver *SeaweedFsDriver, volumeID string) []pb.ServerAddress {
+	if filerAddress, _ := DecodeVolumeID(volumeID); filerAddress != "" {
+		return pb.ServerAddresses(filerAddress).ToAddresses()
+	}
+	return driver.filers
+}
+
 func newFilerVacStore(filers []pb.ServerAddress) (*filerVacStore, error) {
 	tlsConfig, err := vacStoreTLSConfig()
 	if err != nil {
@@ -148,7 +179,7 @@ func (s *filerVacStore) Read(ctx context.Context, volumeID string) (map[string]s
 	}
 	var entry vacEntry
 	if err := json.Unmarshal(body, &entry); err != nil {
-		return nil, fmt.Errorf("corrupt persisted parameters for %s: %w", volumeID, err)
+		return nil, &errCorruptVacEntry{volumeID: volumeID, err: err}
 	}
 	return entry.Parameters, nil
 }
