@@ -8,6 +8,19 @@ storageClassVolumeBindingMode: Immediate
 storageClassParameters: {}
 isDefaultStorageClass: false
 tlsSecret: ""
+
+# TLS for the VAC store — the driver persists VolumeAttributesClass
+# parameters on the filer via its HTTP API, independent from [grpc] ca in
+# security.toml which configures gRPC trust only.
+vacStore:
+  # true => https://, false (default) => http://
+  useTls: false
+  # In-container CA bundle path for verifying the filer HTTP certificate.
+  # Falls back to [grpc] ca, then to the system trust store.
+  caFile: ""
+  # Existing Secret mounted read-only at /var/run/secrets/vac-ca so caFile
+  # can reference it, e.g. /var/run/secrets/vac-ca/ca.crt
+  caSecret: ""
 #logVerbosity: 4
 #cacheCapacityMB: 0
 #cacheMetaTtlSec: 60

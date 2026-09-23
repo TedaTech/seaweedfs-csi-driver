@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -87,11 +88,39 @@ type NodeServer struct {
 	vacLoader func(ctx context.Context, volumeID string) (map[string]string, error)
 }
 
+// loadPersistedVolumeAttributes reads a volume's VolumeAttributesClass
+// parameters, if any were ever persisted.
+//
+// A failure to REACH the store is deliberately not an error. This is read on
+// every stage, so propagating an availability failure makes an optional
+// feature a hard dependency of mounting: on 2026-09-23 a misconfigured scheme
+// in this store failed every NodeStageVolume on the platform, on a cluster
+// with no VolumeAttributesClass objects at all. Degrading costs at most a
+// parameter that does not get applied; not degrading costs every mount.
+//
+// A corrupt entry still fails: the document exists and is wrong, which is a
+// real inconsistency rather than an availability problem.
 func (ns *NodeServer) loadPersistedVolumeAttributes(ctx context.Context, volumeID string) (map[string]string, error) {
 	if ns.vacLoader != nil {
 		return ns.vacLoader(ctx, volumeID)
 	}
-	return newFilerVacStore(ns.Driver.filers).Read(ctx, volumeID)
+
+	store, err := newFilerVacStore(vacFilersForVolume(ns.Driver, volumeID))
+	if err != nil {
+		glog.Warningf("could not build the volume attributes store for %s, continuing without persisted parameters: %v", volumeID, err)
+		return nil, nil
+	}
+
+	params, err := store.Read(ctx, volumeID)
+	if err != nil {
+		var corrupt *errCorruptVacEntry
+		if errors.As(err, &corrupt) {
+			return nil, err
+		}
+		glog.Warningf("could not read persisted volume attributes for %s, continuing without them: %v", volumeID, err)
+		return nil, nil
+	}
+	return params, nil
 }
 
 var _ = csi.NodeServer(&NodeServer{})

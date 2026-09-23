@@ -87,6 +87,14 @@ spec:
               value: unix:///csi/csi.sock
             - name: SEAWEEDFS_FILER
               value: {{ .Values.seaweedfsFiler | quote }}
+            {{- if .Values.vacStore.useTls }}
+            - name: WEED_VAC_USE_TLS
+              value: "true"
+            {{- with .Values.vacStore.caFile }}
+            - name: WEED_VAC_CA
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             - name: NODE_ID
               valueFrom:
                 fieldRef:
@@ -132,6 +140,11 @@ spec:
             {{- if .Values.tlsSecret }}
             - name: tls
               mountPath: /var/run/secrets/app/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.vacStore.caSecret }}
+            - name: vac-ca
+              mountPath: /var/run/secrets/vac-ca
               readOnly: true
             {{- end }}
             {{- include "seaweedfs-csi-driver.security-volumemount" . | nindent 12 }}
@@ -251,6 +264,11 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tlsSecret }}
+        {{- end }}
+        {{- if .Values.vacStore.caSecret }}
+        - name: vac-ca
+          secret:
+            secretName: {{ .Values.vacStore.caSecret }}
         {{- end }}
         {{- include "seaweedfs-csi-driver.security-volume" . | nindent 8 }}
         {{- if and $mountEndpoint $mountSocketDir $mountHostPath }}

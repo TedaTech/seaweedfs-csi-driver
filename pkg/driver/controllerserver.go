@@ -48,11 +48,13 @@ type ControllerServer struct {
 	vacStore vacStore
 }
 
-func (cs *ControllerServer) store() vacStore {
+// storeForVolume returns the VAC store holding this volume's attributes. The
+// volume ID decides which filer that is — see vacFilersForVolume.
+func (cs *ControllerServer) storeForVolume(volumeID string) (vacStore, error) {
 	if cs.vacStore != nil {
-		return cs.vacStore
+		return cs.vacStore, nil
 	}
-	return newFilerVacStore(cs.Driver.filers)
+	return newFilerVacStore(vacFilersForVolume(cs.Driver, volumeID))
 }
 
 var _ = csi.ControllerServer(&ControllerServer{})
@@ -195,8 +197,16 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, fmt.Errorf("error deleting volume %s: %v", volumeId, err)
 	}
 
-	if err := cs.store().Delete(ctx, volumeId); err != nil {
-		glog.Warningf("could not delete persisted volume attributes for %s: %v", volumeId, err)
+	// Key off the ORIGINAL volume ID, not the decoded path resolveVolume left
+	// in volumeId: ControllerModifyVolume writes the entry under the raw ID,
+	// and vacPath base64-encodes whatever it is given, so the two must be the
+	// same string or the delete silently targets a key that was never written.
+	store, err := cs.storeForVolume(req.VolumeId)
+	if err == nil {
+		err = store.Delete(ctx, req.VolumeId)
+	}
+	if err != nil {
+		glog.Warningf("could not delete persisted volume attributes for %s: %v", req.VolumeId, err)
 	}
 
 	return &csi.DeleteVolumeResponse{}, nil
@@ -494,7 +504,11 @@ func (cs *ControllerServer) ControllerModifyVolume(ctx context.Context, req *csi
 	// so persist the accepted values where NodeStageVolume can read them
 	// back on every (re)stage. Storage errors fail the modify so the
 	// resizer retries instead of recording a class that never applies.
-	if err := cs.store().Write(ctx, volumeID, req.GetMutableParameters()); err != nil {
+	store, err := cs.storeForVolume(volumeID)
+	if err == nil {
+		err = store.Write(ctx, volumeID, req.GetMutableParameters())
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"persisting modified parameters for %s: %v", volumeID, err)
 	}
