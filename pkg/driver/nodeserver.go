@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -476,7 +475,7 @@ func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 			Available: usage.availableBytes,
 		},
 	}
-	if usage.inodes > 0 && usage.inodes != math.MaxInt64 {
+	if usage.inodes > 0 {
 		respUsage = append(respUsage, &csi.VolumeUsage{
 			Unit:      csi.VolumeUsage_INODES,
 			Total:     usage.inodes,

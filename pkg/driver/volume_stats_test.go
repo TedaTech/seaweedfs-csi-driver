@@ -142,7 +142,7 @@ func TestNodeGetVolumeStatsInodeSentinel(t *testing.T) {
 	}
 
 	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
-		return &volumeUsage{capacityBytes: 10, availableBytes: 7, inodes: math.MaxInt64}, nil
+		return &volumeUsage{capacityBytes: 10, availableBytes: 7, inodes: math.MaxInt64, inodesUsed: 41840, inodesFree: math.MaxInt64 - 41840}, nil
 	}
 	resp, err = ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
 		VolumeId:   "vol-1",
@@ -151,8 +151,8 @@ func TestNodeGetVolumeStatsInodeSentinel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
-	if got := findUsage(resp, csi.VolumeUsage_INODES); got != nil {
-		t.Fatalf("expected MaxInt64 inode sentinel to be omitted, got %v", got)
+	if got := findUsage(resp, csi.VolumeUsage_INODES); got == nil || got.Used != 41840 {
+		t.Fatalf("expected the file count of an unbounded volume to be reported, got %v", got)
 	}
 }
 
