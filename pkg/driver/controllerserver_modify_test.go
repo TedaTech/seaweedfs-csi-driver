@@ -54,7 +54,14 @@ func modifyTestDriver() (*ControllerServer, *memVacStore) {
 		csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
 	})
 	store := newMemVacStore()
-	return &ControllerServer{Driver: driver, vacStore: store}, store
+	cs := &ControllerServer{Driver: driver, vacStore: store}
+	// Default to a PV carrying no static mutable attributes, so tests do
+	// not depend on an in-cluster k8s client. Tests that exercise the
+	// merged-set validation override pvAttributesFn.
+	cs.pvAttributesFn = func(_ context.Context, _ string) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	return cs, store
 }
 
 func hasModifyVolumeCapability(cs *ControllerServer) bool {
@@ -285,5 +292,117 @@ func TestControllerModifyVolume_WriteFailureFailsModify(t *testing.T) {
 	})
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("code = %v, want Internal", status.Code(err))
+	}
+}
+
+func TestControllerModifyVolume_WritebackTunables(t *testing.T) {
+	cs, store := modifyTestDriver()
+	if _, err := cs.ControllerModifyVolume(context.Background(), &csi.ControllerModifyVolumeRequest{
+		VolumeId: "pvc-abc",
+		MutableParameters: map[string]string{
+			"writebackCache":       "true",
+			"metadataFlushSeconds": "300",
+		},
+	}); err != nil {
+		t.Fatalf("writeback tunables rejected: %v", err)
+	}
+	params, err := store.Read(context.Background(), "pvc-abc")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if params["writebackCache"] != "true" || params["metadataFlushSeconds"] != "300" {
+		t.Fatalf("persisted parameters lost: %v", params)
+	}
+}
+
+func TestControllerModifyVolume_RejectsWritebackDlmCombo(t *testing.T) {
+	cs, _ := modifyTestDriver()
+	_, err := cs.ControllerModifyVolume(context.Background(), &csi.ControllerModifyVolumeRequest{
+		VolumeId: "pvc-abc",
+		MutableParameters: map[string]string{
+			"writebackCache": "true",
+			"dlm":            "true",
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (mutually exclusive)", status.Code(err))
+	}
+}
+
+func TestControllerModifyVolume_RejectsInvalidWritebackTunables(t *testing.T) {
+	cs, _ := modifyTestDriver()
+	for key, value := range map[string]string{
+		"writebackCache":       "yes",
+		"dlm":                  "maybe",
+		"metadataFlushSeconds": "ten",
+	} {
+		_, err := cs.ControllerModifyVolume(context.Background(), &csi.ControllerModifyVolumeRequest{
+			VolumeId:          "pvc-abc",
+			MutableParameters: map[string]string{key: value},
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("%s=%q: code = %v, want InvalidArgument", key, value, status.Code(err))
+		}
+	}
+}
+
+func TestMounterConsumesWritebackTunables(t *testing.T) {
+	d := &SeaweedFsDriver{name: "test", CacheCapacityMB: 0, CacheMetaTtlSec: 60}
+	m := &mountServiceMounter{driver: d, volContext: map[string]string{
+		"writebackCache":       "true",
+		"metadataFlushSeconds": "300",
+		"dlm":                  "true",
+	}, volumeID: "/buckets/pvc-abc", readOnly: false}
+	args, err := m.buildMountArgs("/tmp/target", "/var/cache/x", "/var/lib/seaweedfs-mount.sock", []string{"127.0.0.1:8888"})
+	if err != nil {
+		t.Fatalf("buildMountArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-writebackCache=true", "-metadataFlushSeconds=300", "-dlm=true"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("mount args missing %s: %s", want, joined)
+		}
+	}
+}
+
+func TestControllerModifyVolume_ValidatesMergedPvAttributes(t *testing.T) {
+	// PV carries static dlm=true; the class only flips writebackCache — the
+	// combo is invisible to the mutable parameters alone, so the merged
+	// effective set must be validated before persisting.
+	cs, store := modifyTestDriver()
+	cs.pvAttributesFn = func(_ context.Context, volumeID string) (map[string]string, error) {
+		return map[string]string{"dlm": "true"}, nil
+	}
+	_, err := cs.ControllerModifyVolume(context.Background(), &csi.ControllerModifyVolumeRequest{
+		VolumeId:          "pvc-abc",
+		MutableParameters: map[string]string{"writebackCache": "true"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument for the merged combo", status.Code(err))
+	}
+	if len(store.data) != 0 {
+		t.Fatalf("rejected modification must not be persisted: %v", store.data)
+	}
+}
+
+func TestControllerModifyVolume_FailsWhenPvAttributesUnreadable(t *testing.T) {
+	// The PV lookup is the only source of the static half of the effective
+	// set. When it fails the combo check is meaningless, so the modify must
+	// fail with a retryable error and must not persist the unvalidated
+	// parameters — otherwise a transient API outage could record a
+	// combination that every later stage rejects.
+	cs, store := modifyTestDriver()
+	cs.pvAttributesFn = func(_ context.Context, volumeID string) (map[string]string, error) {
+		return nil, errors.New("api server unreachable")
+	}
+	_, err := cs.ControllerModifyVolume(context.Background(), &csi.ControllerModifyVolumeRequest{
+		VolumeId:          "pvc-abc",
+		MutableParameters: map[string]string{"concurrentReaders": "32"},
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal (retryable)", status.Code(err))
+	}
+	if len(store.data) != 0 {
+		t.Fatalf("failed modify must not be persisted: %v", store.data)
 	}
 }

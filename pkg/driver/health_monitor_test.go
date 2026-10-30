@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -755,5 +756,254 @@ func TestHealthMonitorRecoversWhenStagingPathVanished(t *testing.T) {
 
 	if state.stageCalls != 2 {
 		t.Errorf("expected recovery to re-stage a vanished mount, got %d stage calls", state.stageCalls)
+	}
+}
+
+// A mount whose FUSE daemon is dead can still answer the statx-based
+// mount-point check from cached inode attributes while every real I/O fails
+// with ENOTCONN. Recovery must then detach the dead mount instead of
+// aborting at the "still a mount point" guard forever.
+func TestHealthMonitorRecoversDeadMountpoint(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume("vol-1", stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	// A restarted mount service has no record of the old mount process.
+	vol.unmounter = nil
+	ns.volumes.Store("vol-1", vol)
+
+	origMountPoint := isLikelyNotMountPointFn
+	origStatfs := statfsFn
+	origLazy := lazyUnmount
+	defer func() {
+		isLikelyNotMountPointFn = origMountPoint
+		statfsFn = origStatfs
+		lazyUnmount = origLazy
+	}()
+
+	var lazyCalls int
+	isLikelyNotMountPointFn = func(p string) (bool, error) {
+		if p == stagingPath {
+			return false, nil // still a mount point
+		}
+		return origMountPoint(p)
+	}
+	statfsFn = func(p string) error {
+		if p == stagingPath {
+			return syscall.ENOTCONN
+		}
+		return nil
+	}
+	lazyUnmount = func(p string) error {
+		lazyCalls++
+		return nil
+	}
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if lazyCalls != 1 {
+		t.Errorf("expected 1 lazy unmount of the dead staging mount, got %d", lazyCalls)
+	}
+	if state.cleanupCalls != 1 {
+		t.Errorf("expected 1 staging cleanup, got %d", state.cleanupCalls)
+	}
+	if state.stageCalls != 2 {
+		t.Errorf("expected 2 stage calls after recovery, got %d", state.stageCalls)
+	}
+}
+
+// A mount that still answers statfs is alive: recovery must keep refusing
+// to remove the staging path underneath it.
+func TestHealthMonitorStillAbortsOnLiveMountpoint(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume("vol-1", stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	vol.unmounter = nil
+	ns.volumes.Store("vol-1", vol)
+
+	origMountPoint := isLikelyNotMountPointFn
+	origStatfs := statfsFn
+	defer func() {
+		isLikelyNotMountPointFn = origMountPoint
+		statfsFn = origStatfs
+	}()
+
+	isLikelyNotMountPointFn = func(p string) (bool, error) {
+		if p == stagingPath {
+			return false, nil
+		}
+		return origMountPoint(p)
+	}
+	statfsFn = func(p string) error { return nil }
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.cleanupCalls != 0 {
+		t.Errorf("expected no cleanup against a live mount, got %d", state.cleanupCalls)
+	}
+	if state.stageCalls != 1 {
+		t.Errorf("expected no re-stage against a live mount, got %d", state.stageCalls)
+	}
+}
+
+// A mount that still shows up in /proc/mounts but whose daemon hangs
+// statfs is indistinguishable from a live mount: recovery must abort
+// rather than detach it. Timed-out callers must also reuse the one
+// still-blocked probe instead of piling up a syscall goroutine per sweep.
+func TestHealthMonitorAbortsWhenStatfsProbeHangs(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+
+	root := t.TempDir()
+	stagingPath := filepath.Join(root, "staging")
+	volCtx := map[string]string{"collection": "c"}
+
+	vol, err := ns.stageNewVolume("vol-1", stagingPath, volCtx, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+	vol.volContext = volCtx
+	vol.unmounter = nil
+	ns.volumes.Store("vol-1", vol)
+
+	origMountPoint := isLikelyNotMountPointFn
+	origStatfs := statfsFn
+	origLazy := lazyUnmount
+	origTimeout := statfsProbeTimeout
+	statfsProbeTimeout = 50 * time.Millisecond
+	defer func() {
+		isLikelyNotMountPointFn = origMountPoint
+		statfsFn = origStatfs
+		lazyUnmount = origLazy
+		statfsProbeTimeout = origTimeout
+		resetStatfsProbe(stagingPath)
+	}()
+
+	isLikelyNotMountPointFn = func(p string) (bool, error) {
+		if p == stagingPath {
+			return false, nil
+		}
+		return origMountPoint(p)
+	}
+	release := make(chan struct{})
+	defer close(release)
+	statfsStarted := make(chan struct{})
+	var startOnce sync.Once
+	var statfsCalls atomic.Int32
+	statfsFn = func(p string) error {
+		if p == stagingPath {
+			statfsCalls.Add(1)
+			startOnce.Do(func() { close(statfsStarted) })
+			<-release
+		}
+		return nil
+	}
+	var lazyCalls int
+	lazyUnmount = func(p string) error {
+		lazyCalls++
+		return nil
+	}
+	state.healthy.Store(false)
+
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	// Once the first probe's syscall is known to be blocked, a second
+	// sweep must attach to it rather than spawn another statfs call.
+	<-statfsStarted
+	ns.checkAndRecoverVolumes()
+	ns.recoveryWg.Wait()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if lazyCalls != 0 {
+		t.Errorf("expected no lazy unmount against a hung mount, got %d", lazyCalls)
+	}
+	if state.cleanupCalls != 0 {
+		t.Errorf("expected no cleanup against a hung mount, got %d", state.cleanupCalls)
+	}
+	if state.stageCalls != 1 {
+		t.Errorf("expected no re-stage against a hung mount, got %d", state.stageCalls)
+	}
+	if got := statfsCalls.Load(); got != 1 {
+		t.Errorf("expected the second sweep to reuse the in-flight probe, got %d statfs syscalls", got)
+	}
+}
+
+// Unstage removes the mount at the staging path. A statfs probe still
+// blocked against that old mount must be invalidated; otherwise a mount
+// re-staged at the same path inherits the blocked probe and never
+// reports healthy.
+func TestUnstageResetsBlockedStatfsProbe(t *testing.T) {
+	state := newFakeMountState()
+	ns := newNodeServerWithFakes(t, state)
+
+	stagingPath := filepath.Join(t.TempDir(), "staging")
+	vol, err := ns.stageNewVolume("vol-1", stagingPath, map[string]string{}, false)
+	if err != nil {
+		t.Fatalf("stageNewVolume: %v", err)
+	}
+
+	origStatfs := statfsFn
+	origTimeout := statfsProbeTimeout
+	statfsProbeTimeout = 50 * time.Millisecond
+	defer func() {
+		statfsFn = origStatfs
+		statfsProbeTimeout = origTimeout
+		resetStatfsProbe(stagingPath)
+	}()
+
+	release := make(chan struct{})
+	defer close(release)
+	var statfsCalls atomic.Int32
+	statfsFn = func(p string) error {
+		if p == stagingPath {
+			statfsCalls.Add(1)
+			<-release
+		}
+		return nil
+	}
+
+	// The first probe blocks in the syscall and stays registered.
+	if _, probed := probeStatfs(stagingPath); probed {
+		t.Fatal("expected the blocked probe to time out")
+	}
+
+	if err := vol.Unstage(stagingPath); err != nil {
+		t.Fatalf("Unstage: %v", err)
+	}
+
+	// A probe after unstage must issue a fresh syscall rather than
+	// attach to the orphaned one.
+	if _, probed := probeStatfs(stagingPath); probed {
+		t.Fatal("expected the new probe to time out as well")
+	}
+	if got := statfsCalls.Load(); got != 2 {
+		t.Errorf("expected a fresh statfs syscall after unstage reset the probe, got %d", got)
 	}
 }
