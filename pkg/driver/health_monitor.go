@@ -260,6 +260,19 @@ func (ns *NodeServer) performVolumeHealthCheck(volumeID string) {
 	}
 }
 
+// isDeadMount reports whether path is a mount whose daemon is dead. The
+// probe is bounded like checkHealth and deduplicated per path: a timeout
+// is inconclusive — a live but hung mount — which must not be detached
+// and removed underneath containers.
+func isDeadMount(path string) bool {
+	err, probed := probeStatfs(path)
+	if !probed {
+		glog.Warningf("health monitor: statfs probe for %s timed out, treating the mount as live", path)
+		return false
+	}
+	return mount.IsCorruptedMnt(err)
+}
+
 // hasUnhealthyPublishPath returns true if any of the Volume's tracked
 // publish paths is not currently a live, readable mount point. It uses
 // the same isHealthyFn as staging so behavior stays consistent across
@@ -285,6 +298,7 @@ func (ns *NodeServer) hasUnhealthyPublishPath(vol *Volume) bool {
 // dead FUSE.
 func (ns *NodeServer) tearDownStalePublishBind(path, volumeID string) bool {
 	if err := ns.unmountFn(path); err == nil {
+		resetStatfsProbe(path)
 		return true
 	} else {
 		glog.Warningf("health monitor: unmount publish path %s for volume %s failed: %v, trying force cleanup", path, volumeID, err)
@@ -293,6 +307,7 @@ func (ns *NodeServer) tearDownStalePublishBind(path, volumeID string) bool {
 		glog.Errorf("health monitor: force cleanup of publish path %s for volume %s also failed: %v; skipping re-publish to avoid Publish() falsely satisfying the stale mount", path, volumeID, cleanupErr)
 		return false
 	}
+	resetStatfsProbe(path)
 	return true
 }
 
@@ -443,15 +458,31 @@ func (ns *NodeServer) recoverVolume(volumeID string) {
 			glog.Errorf("health monitor: unmount via mount manager failed for volume %s, aborting recovery: %v", volumeID, err)
 			return
 		}
+		// The mount was detached; an in-flight probe's result describes
+		// the old mount and must not be reused for its replacement.
+		resetStatfsProbe(stagingPath)
 	}
 
 	// RemoveAll on a still-mounted FUSE would delete remote data via
 	// gRPC. FUSE can still be alive here if vol.unmounter was nil
 	// (rebuilt volume) or wait()'s kubeMounter.Unmount silently failed.
-	if notMnt, err := mountutil.IsLikelyNotMountPoint(stagingPath); err == nil && !notMnt {
-		recordRecovery(volumeID, recoveryOutcomeFailed)
-		glog.Errorf("health monitor: refusing to clean up staging path %s for volume %s — still a mount point; aborting recovery to avoid data deletion", stagingPath, volumeID)
-		return
+	if notMnt, err := isLikelyNotMountPointFn(stagingPath); err == nil && !notMnt {
+		// A dead FUSE still looks mounted: the kernel keeps the entry and
+		// serves statx from cached inode attributes, so only a probe that
+		// reaches the daemon tells them apart. A dead mount serves no
+		// I/O, so detaching it before cleanup cannot delete remote data.
+		if !isDeadMount(stagingPath) {
+			recordRecovery(volumeID, recoveryOutcomeFailed)
+			glog.Errorf("health monitor: refusing to clean up staging path %s for volume %s — still a mount point; aborting recovery to avoid data deletion", stagingPath, volumeID)
+			return
+		}
+		glog.Warningf("health monitor: staging mount for volume %s at %s is dead; detaching it before cleanup", volumeID, stagingPath)
+		if err := lazyUnmount(stagingPath); err != nil {
+			glog.Errorf("health monitor: detaching dead staging mount %s for volume %s failed: %v; aborting recovery", stagingPath, volumeID, err)
+			recordRecovery(volumeID, recoveryOutcomeFailed)
+			return
+		}
+		resetStatfsProbe(stagingPath)
 	}
 
 	// Step 2: Clean up stale staging path

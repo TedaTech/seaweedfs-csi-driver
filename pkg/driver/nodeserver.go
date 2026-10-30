@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ type NodeServer struct {
 	// information about the managed volumes
 	volumes       sync.Map
 	volumeMutexes *KeyMutex
+	activeStats   sync.Map
 
 	// stopCh signals the health monitor goroutine to stop. Guarded by
 	// stopOnce so NodeCleanup is safe to call from multiple shutdown paths.
@@ -72,16 +74,16 @@ type NodeServer struct {
 	recoveryBackoff sync.Map // map[string]recoveryBackoffState
 
 	// Injectable factories / operations (overridden in tests).
-	mounterFactory   MounterFactory
-	capacityFn       CapacityFn
-	isHealthyFn      HealthCheckFn
-	isLiveFn         LivenessCheckFn
-	cleanupStagingFn func(stagingPath string) error
-	unmountFn        func(path string) error
-	bindMountFn      BindMountFn
-	statfsFn         StatfsFn
-	nodeLabelsFn     NodeLabelsFn
-	nowFn            func() time.Time
+	mounterFactory    MounterFactory
+	capacityFn        CapacityFn
+	isHealthyFn       HealthCheckFn
+	isLiveFn          LivenessCheckFn
+	cleanupStagingFn  func(stagingPath string) error
+	unmountFn         func(path string) error
+	bindMountFn       BindMountFn
+	nodeLabelsFn      NodeLabelsFn
+	nowFn             func() time.Time
+	readVolumeUsageFn func(path string) (*volumeUsage, error)
 
 	// vacLoader reads the persisted VolumeAttributesClass parameters for a
 	// volume. Nil means the default filer-backed store.
@@ -336,7 +338,9 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		glog.Warningf("volume %s hasn't been published", volumeID)
 
 		// make sure there is no any garbage
-		_ = mount.CleanupMountPoint(targetPath, mountutil, true)
+		if err := mount.CleanupMountPoint(targetPath, mountutil, true); err == nil {
+			resetStatfsProbe(targetPath)
+		}
 
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
@@ -431,6 +435,61 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 	}, nil
 }
 
+// NodeGetVolumeStats reports filesystem usage for a staged or published volume.
+func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume path missing in request")
+	}
+	if err := volumeStatsSupported(); err != nil {
+		return nil, err
+	}
+
+	statsCtx, cancel := context.WithTimeout(ctx, defaultHealthCheckTimeout)
+	defer cancel()
+
+	unlock, err := ns.lockVolumeStats(statsCtx, volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if err := ns.validateVolumeStatsPath(volumeID, volumePath); err != nil {
+		return nil, err
+	}
+
+	usage, err := ns.readVolumeUsageWithTimeout(statsCtx, volumeID, volumePath)
+	if err != nil {
+		return nil, err
+	}
+
+	respUsage := []*csi.VolumeUsage{
+		{
+			Unit:      csi.VolumeUsage_BYTES,
+			Total:     usage.capacityBytes,
+			Used:      usage.usedBytes,
+			Available: usage.availableBytes,
+		},
+	}
+	if usage.inodes > 0 && usage.inodes != math.MaxInt64 {
+		respUsage = append(respUsage, &csi.VolumeUsage{
+			Unit:      csi.VolumeUsage_INODES,
+			Total:     usage.inodes,
+			Used:      usage.inodesUsed,
+			Available: usage.inodesFree,
+		})
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: respUsage,
+	}, nil
+}
+
 func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
@@ -454,7 +513,9 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		glog.Warningf("volume %s hasn't been staged", volumeID)
 
 		// make sure there is no any garbage
-		_ = mount.CleanupMountPoint(stagingTargetPath, mountutil, true)
+		if err := mount.CleanupMountPoint(stagingTargetPath, mountutil, true); err == nil {
+			resetStatfsProbe(stagingTargetPath)
+		}
 
 		// Also clean up cache directory and socket if they exist
 		CleanupVolumeResources(ns.Driver, volumeID)
@@ -538,6 +599,15 @@ func (ns *NodeServer) stageNewVolume(volumeID, stagingTargetPath string, volCont
 	}
 	if len(persisted) > 0 {
 		mergePersistedVolumeAttributes(effectiveVolContext, persisted)
+	}
+	// Static PV attributes skip controller-side validation entirely, so the
+	// fully merged context is validated here — the last point before the
+	// mount command is built.
+	if err := validateConstrainedParameterValues(effectiveVolContext); err != nil {
+		return nil, fmt.Errorf("invalid argument: %w", err)
+	}
+	if err := validateWritebackDlmCombo(effectiveVolContext); err != nil {
+		return nil, fmt.Errorf("invalid argument: %w", err)
 	}
 	capacity, hasCapacity, err := ns.resolveVolumeCapacity(volumeID, effectiveVolContext)
 	if err != nil {
