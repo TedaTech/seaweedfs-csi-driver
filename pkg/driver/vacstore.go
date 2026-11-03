@@ -15,6 +15,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -50,9 +51,13 @@ func vacPath(volumeID string) string {
 // state follows the filer store and survives PV recreation and cluster
 // rebuilds as long as the data does.
 type filerVacStore struct {
-	filers []pb.ServerAddress
-	scheme string
-	client *http.Client
+	filers              []pb.ServerAddress
+	scheme              string
+	client              *http.Client
+	signingKey          security.SigningKey
+	expiresAfterSec     int
+	readSigningKey      security.SigningKey
+	readExpiresAfterSec int
 }
 
 // errCorruptVacEntry marks a stored document that could not be decoded. It is
@@ -86,21 +91,54 @@ func vacFilersForVolume(driver *SeaweedFsDriver, volumeID string) []pb.ServerAdd
 	return driver.filers
 }
 
+// newFilerVacStore snapshots the filer JWT signing configuration and builds
+// the HTTP client for the VAC path; the transport stays plain HTTP unless
+// vac.use_tls is set. Redirects that would carry the JWT from https onto
+// http are refused.
 func newFilerVacStore(filers []pb.ServerAddress) (*filerVacStore, error) {
 	tlsConfig, err := vacStoreTLSConfig()
 	if err != nil {
 		return nil, err
 	}
 	scheme := "http"
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme == "http" && req.Header.Get("Authorization") != "" {
+				return fmt.Errorf("refusing HTTPS-to-HTTP redirect to %s that would expose the filer JWT", req.URL.Host)
+			}
+			return nil
+		},
+	}
 	if tlsConfig != nil {
 		scheme = "https"
 		client.Transport = &http.Transport{TLSClientConfig: tlsConfig}
 	}
+	v := util.GetViper()
+	signingKey := security.SigningKey(v.GetString("jwt.filer_signing.key"))
+	expiresAfterSec := v.GetInt("jwt.filer_signing.expires_after_seconds")
+	if expiresAfterSec == 0 {
+		expiresAfterSec = 10
+	}
+	readSigningKey := security.SigningKey(v.GetString("jwt.filer_signing.read.key"))
+	readExpiresAfterSec := v.GetInt("jwt.filer_signing.read.expires_after_seconds")
+	if readExpiresAfterSec == 0 {
+		readExpiresAfterSec = 60
+	}
+	if scheme == "http" && (len(signingKey) != 0 || len(readSigningKey) != 0) {
+		glog.Warningf("VAC store sends filer JWTs over plain HTTP; set vac.use_tls (WEED_VAC_USE_TLS) so the tokens are not exposed in transit")
+	}
 	return &filerVacStore{
-		filers: filers,
-		scheme: scheme,
-		client: client,
+		filers:              filers,
+		scheme:              scheme,
+		client:              client,
+		signingKey:          signingKey,
+		expiresAfterSec:     expiresAfterSec,
+		readSigningKey:      readSigningKey,
+		readExpiresAfterSec: readExpiresAfterSec,
 	}, nil
 }
 
@@ -134,6 +172,8 @@ func vacStoreTLSConfig() (*tls.Config, error) {
 	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }
 
+// roundTrip sends the request to each configured filer until one answers
+// with an accepted status code.
 func (s *filerVacStore) roundTrip(ctx context.Context, method, volumeID string, body []byte, okCodes ...int) ([]byte, error) {
 	var lastErr error
 	for _, filer := range s.filers {
@@ -145,6 +185,14 @@ func (s *filerVacStore) roundTrip(ctx context.Context, method, volumeID string, 
 		req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
 		if err != nil {
 			return nil, err
+		}
+		isWrite := method != http.MethodGet && method != http.MethodHead
+		signingKey, expiresAfterSec := s.readSigningKey, s.readExpiresAfterSec
+		if isWrite {
+			signingKey, expiresAfterSec = s.signingKey, s.expiresAfterSec
+		}
+		if token := security.GenJwtForFilerServer(signingKey, expiresAfterSec); token != "" {
+			req.Header.Set("Authorization", security.BearerPrefix+string(token))
 		}
 		resp, err := s.client.Do(req)
 		if err != nil {
@@ -166,6 +214,8 @@ func (s *filerVacStore) roundTrip(ctx context.Context, method, volumeID string, 
 	return nil, lastErr
 }
 
+// Read returns the persisted mutable parameters for volumeID, or nil when no
+// entry exists.
 func (s *filerVacStore) Read(ctx context.Context, volumeID string) (map[string]string, error) {
 	if len(s.filers) == 0 {
 		return nil, nil
@@ -184,6 +234,7 @@ func (s *filerVacStore) Read(ctx context.Context, volumeID string) (map[string]s
 	return entry.Parameters, nil
 }
 
+// Write persists params as the volume's VAC entry on the filer.
 func (s *filerVacStore) Write(ctx context.Context, volumeID string, params map[string]string) error {
 	if len(params) == 0 {
 		return nil
@@ -196,6 +247,7 @@ func (s *filerVacStore) Write(ctx context.Context, volumeID string, params map[s
 	return err
 }
 
+// Delete removes the persisted VAC entry for volumeID.
 func (s *filerVacStore) Delete(ctx context.Context, volumeID string) error {
 	_, err := s.roundTrip(ctx, http.MethodDelete, volumeID, nil, http.StatusOK, http.StatusNotFound, http.StatusNoContent)
 	return err

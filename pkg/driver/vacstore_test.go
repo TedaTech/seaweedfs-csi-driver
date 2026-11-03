@@ -12,8 +12,12 @@ import (
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+// newTestVacServer returns an in-memory filer standing in for the VAC HTTP
+// API, plus the backing map it stores entries in.
 func newTestVacServer(t *testing.T) (*httptest.Server, map[string]string) {
 	t.Helper()
 	files := map[string]string{}
@@ -43,6 +47,7 @@ func newTestVacServer(t *testing.T) (*httptest.Server, map[string]string) {
 	return server, files
 }
 
+// testStoreFor builds a filerVacStore pointed at the given test server.
 func testStoreFor(t *testing.T, server *httptest.Server) *filerVacStore {
 	t.Helper()
 	addr := strings.TrimPrefix(server.URL, "http://")
@@ -218,5 +223,134 @@ func TestFilerVacStoreReadNoFilers(t *testing.T) {
 	params, err := store.Read(context.Background(), "/buckets/pvc-abc")
 	if err != nil || params != nil {
 		t.Fatalf("expected nil,nil with no filers, got %v, %v", params, err)
+	}
+}
+
+// setFilerJwtKeys swaps the viper filer signing keys for the test and
+// restores the previous values afterwards.
+func setFilerJwtKeys(t *testing.T, writeKey, readKey string) {
+	t.Helper()
+	v := util.GetViper()
+	oldWrite, oldRead := v.GetString("jwt.filer_signing.key"), v.GetString("jwt.filer_signing.read.key")
+	v.Set("jwt.filer_signing.key", writeKey)
+	v.Set("jwt.filer_signing.read.key", readKey)
+	t.Cleanup(func() {
+		v.Set("jwt.filer_signing.key", oldWrite)
+		v.Set("jwt.filer_signing.read.key", oldRead)
+	})
+}
+
+// Requests must carry a filer JWT minted from the filer_signing keys: the
+// read key for GET/HEAD, the write key for everything else.
+func TestFilerVacStoreSignsRequests(t *testing.T) {
+	const (
+		writeKey = "write-signing-key"
+		readKey  = "read-signing-key"
+	)
+
+	check := func(r *http.Request, key string) bool {
+		tokenStr := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		token, err := security.DecodeJwt(security.SigningKey(key), security.EncodedJwt(tokenStr), &security.SeaweedFilerClaims{})
+		return err == nil && token.Valid
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		key := writeKey
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			key = readKey
+		}
+		if !check(r, key) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodGet:
+			io.WriteString(w, `{"parameters":{"disk":"ssd"}}`)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	setFilerJwtKeys(t, writeKey, readKey)
+	t.Setenv("WEED_VAC_USE_TLS", "")
+
+	store := testStoreFor(t, server)
+	if err := store.Write(context.Background(), "/buckets/pvc-abc", map[string]string{"disk": "ssd"}); err != nil {
+		t.Fatalf("Write with signed request: %v", err)
+	}
+	params, err := store.Read(context.Background(), "/buckets/pvc-abc")
+	if err != nil {
+		t.Fatalf("Read with signed request: %v", err)
+	}
+	if params["disk"] != "ssd" {
+		t.Fatalf("unexpected params: %v", params)
+	}
+	if err := store.Delete(context.Background(), "/buckets/pvc-abc"); err != nil {
+		t.Fatalf("Delete with signed request: %v", err)
+	}
+}
+
+// A same-host HTTPS-to-HTTP redirect would make the Go client resend the
+// Authorization header in cleartext, so the store refuses to follow it.
+func TestFilerVacStoreRejectsTlsDowngradeRedirect(t *testing.T) {
+	httpHits := 0
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plain.Close()
+
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer tlsServer.Close()
+
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsServer.Certificate().Raw})
+	if err := os.WriteFile(caFile, caPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+	setFilerJwtKeys(t, "write-key", "read-key")
+	t.Setenv("WEED_VAC_USE_TLS", "true")
+	t.Setenv("WEED_VAC_CA", caFile)
+	t.Setenv("WEED_GRPC_CA", "")
+
+	addr := strings.TrimPrefix(tlsServer.URL, "https://")
+	store, err := newFilerVacStore([]pb.ServerAddress{pb.ServerAddress(addr)})
+	if err != nil {
+		t.Fatalf("newFilerVacStore: %v", err)
+	}
+	if _, err := store.Read(context.Background(), "/buckets/pvc-abc"); err == nil {
+		t.Fatal("expected the credential-bearing downgrade redirect to be refused")
+	}
+	if httpHits != 0 {
+		t.Fatal("plain-HTTP endpoint received the redirected request")
+	}
+}
+
+// With no signing keys configured no Authorization header is sent.
+func TestFilerVacStoreNoKeysNoAuthHeader(t *testing.T) {
+	setFilerJwtKeys(t, "", "")
+
+	var sawAuth bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			sawAuth = true
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	store := testStoreFor(t, server)
+	if _, err := store.Read(context.Background(), "/buckets/pvc-abc"); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if sawAuth {
+		t.Fatal("Authorization header sent despite empty signing keys")
 	}
 }

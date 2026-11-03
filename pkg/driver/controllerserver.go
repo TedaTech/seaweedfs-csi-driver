@@ -14,6 +14,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/datalocality"
+	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/k8s"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
@@ -46,6 +47,10 @@ type ControllerServer struct {
 	// vacStore persists VolumeAttributesClass parameters accepted by
 	// ControllerModifyVolume. Nil means the default filer-backed store.
 	vacStore vacStore
+
+	// pvAttributesFn reads the static volume attributes of the PV backing a
+	// volume id. Nil means the default in-cluster k8s lookup.
+	pvAttributesFn func(ctx context.Context, volumeID string) (map[string]string, error)
 }
 
 // storeForVolume returns the VAC store holding this volume's attributes. The
@@ -55,6 +60,13 @@ func (cs *ControllerServer) storeForVolume(volumeID string) (vacStore, error) {
 		return cs.vacStore, nil
 	}
 	return newFilerVacStore(vacFilersForVolume(cs.Driver, volumeID))
+}
+
+func (cs *ControllerServer) pvAttributes(ctx context.Context, volumeID string) (map[string]string, error) {
+	if cs.pvAttributesFn != nil {
+		return cs.pvAttributesFn(ctx, volumeID)
+	}
+	return k8s.GetVolumeAttributes(ctx, cs.Driver.name, volumeID)
 }
 
 var _ = csi.ControllerServer(&ControllerServer{})
@@ -426,20 +438,23 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 // excluded since they cannot change after provisioning; collectionQuotaMB is
 // derived from capacity by the mounter.
 var mutableMountParameters = map[string]struct{}{
-	"diskType":           {},
-	"replication":        {},
-	"ttl":                {},
-	"dataCenter":         {},
-	"dataLocality":       {},
-	"uidMap":             {},
-	"gidMap":             {},
-	"chunkSizeLimitMB":   {},
-	"volumeServerAccess": {},
-	"readRetryTime":      {},
-	"concurrentReaders":  {},
-	"concurrentWriters":  {},
-	"cacheCapacityMB":    {},
-	"cacheMetaTtlSec":    {},
+	"diskType":             {},
+	"replication":          {},
+	"ttl":                  {},
+	"dataCenter":           {},
+	"dataLocality":         {},
+	"uidMap":               {},
+	"gidMap":               {},
+	"chunkSizeLimitMB":     {},
+	"volumeServerAccess":   {},
+	"readRetryTime":        {},
+	"concurrentReaders":    {},
+	"concurrentWriters":    {},
+	"cacheCapacityMB":      {},
+	"cacheMetaTtlSec":      {},
+	"writebackCache":       {},
+	"metadataFlushSeconds": {},
+	"dlm":                  {},
 }
 
 func validateMutableParameterValues(key, value string) error {
@@ -451,9 +466,13 @@ func validateMutableParameterValues(key, value string) error {
 		if _, ok := datalocality.FromString(value); !ok {
 			return fmt.Errorf("invalid dataLocality %q", value)
 		}
-	case "concurrentReaders", "concurrentWriters", "cacheCapacityMB", "cacheMetaTtlSec", "chunkSizeLimitMB":
+	case "concurrentReaders", "concurrentWriters", "cacheCapacityMB", "cacheMetaTtlSec", "chunkSizeLimitMB", "metadataFlushSeconds":
 		if _, err := strconv.Atoi(value); err != nil {
 			return fmt.Errorf("%s must be an integer, got %q", key, value)
+		}
+	case "writebackCache", "dlm":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s must be a boolean, got %q", key, value)
 		}
 	}
 	return nil
@@ -480,6 +499,40 @@ func validateMutableParameters(params map[string]string) error {
 	if len(invalid) > 0 {
 		return fmt.Errorf("invalid parameter values: %s", strings.Join(invalid, "; "))
 	}
+	if err := validateWritebackDlmCombo(params); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateConstrainedParameterValues checks the values of recognized
+// mount-time parameters, whether they arrive as StorageClass parameters,
+// persistent volume attributes or VolumeAttributesClass mutable parameters.
+// Keys without a cheap controller-side constraint are skipped.
+func validateConstrainedParameterValues(params map[string]string) error {
+	for key, value := range params {
+		if _, constrained := mutableMountParameters[key]; !constrained {
+			continue
+		}
+		if err := validateMutableParameterValues(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateWritebackDlmCombo rejects writebackCache together with dlm: weed
+// mount requires single-writer mode for writeback caching and silently
+// disables the distributed lock manager when both are requested, which would
+// leave the volume mounted without the coordination the caller asked for.
+func validateWritebackDlmCombo(params map[string]string) error {
+	if wb, dlm := params["writebackCache"], params["dlm"]; wb != "" && dlm != "" {
+		wbOn, wbErr := strconv.ParseBool(wb)
+		dlmOn, dlmErr := strconv.ParseBool(dlm)
+		if wbErr == nil && dlmErr == nil && wbOn && dlmOn {
+			return fmt.Errorf("writebackCache and dlm are mutually exclusive: weed mount disables the distributed lock manager when writeback caching is enabled")
+		}
+	}
 	return nil
 }
 
@@ -496,6 +549,34 @@ func (cs *ControllerServer) ControllerModifyVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "mutable parameters missing in request")
 	}
 	if err := validateMutableParameters(req.GetMutableParameters()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	// Validate the effective set: static PV attributes plus the incoming
+	// mutable parameters. Without this, a class flipping dlm on while the PV
+	// carries static writebackCache=true passes here and the volume only
+	// fails at staging, after the modification was persisted.
+	// If the PV attributes cannot be read, fail with a retryable error
+	// instead of persisting an unvalidated set: the combo check is
+	// meaningless without the static half, and persisting could record a
+	// combination that every later stage rejects.
+	effective := make(map[string]string)
+	attrs, err := cs.pvAttributes(ctx, volumeID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "reading PV attributes for %s: %v", volumeID, err)
+	}
+	for key, value := range attrs {
+		if _, mutable := mutableMountParameters[key]; mutable {
+			effective[key] = value
+		}
+	}
+	for key, value := range req.GetMutableParameters() {
+		effective[key] = value
+	}
+	if err := validateConstrainedParameterValues(effective); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := validateWritebackDlmCombo(effective); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 

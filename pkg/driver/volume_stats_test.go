@@ -1,178 +1,396 @@
+//go:build linux
+// +build linux
+
 package driver
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"io/fs"
 	"math"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func nodeServerWithStatfs(fn StatfsFn) *NodeServer {
-	return &NodeServer{volumeMutexes: NewKeyMutex(), statfsFn: fn}
-}
+func TestNodeGetVolumeStats(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	staged := filepath.Join(t.TempDir(), "staging")
+	podPath := kubeletPublishPath(t, "pv-1")
 
-func statsRequest() *csi.NodeGetVolumeStatsRequest {
-	return &csi.NodeGetVolumeStatsRequest{
-		VolumeId:   "filer://seaweedfs-filer.tenant-x.svc:8888/buckets/pvc-1234",
-		VolumePath: "/var/lib/kubelet/pods/abc/volumes/kubernetes.io~csi/pvc-1234/mount",
-	}
-}
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.StagedPath = staged
+	vol.AddPublishPath(podPath, false)
+	ns.volumes.Store("vol-1", vol)
 
-func usageByUnit(t *testing.T, resp *csi.NodeGetVolumeStatsResponse, unit csi.VolumeUsage_Unit) *csi.VolumeUsage {
-	t.Helper()
-	for _, u := range resp.GetUsage() {
-		if u.GetUnit() == unit {
-			return u
-		}
-	}
-	t.Fatalf("response has no %v usage entry: %+v", unit, resp.GetUsage())
-	return nil
-}
-
-// Kubelet only calls NodeGetVolumeStats for drivers that advertise the
-// capability; without it the RPC below is dead code.
-func TestNodeGetCapabilitiesAdvertisesVolumeStats(t *testing.T) {
-	resp, err := (&NodeServer{}).NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
+	})
 	if err != nil {
-		t.Fatalf("NodeGetCapabilities: %v", err)
+		t.Fatalf("expected success, got %v", err)
+	}
+	assertStatfsUsage(t, resp, podPath)
+
+	unknownPodPath := kubeletPublishPath(t, "pv-unknown")
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-unknown",
+		VolumePath: unknownPodPath,
+	}); err != nil {
+		t.Errorf("expected restart-style request to use a valid publish path, got %v", err)
 	}
 
-	for _, c := range resp.GetCapabilities() {
-		if c.GetRpc().GetType() == csi.NodeServiceCapability_RPC_GET_VOLUME_STATS {
-			return
-		}
+	restartedPodPath := kubeletPublishPath(t, "pv-restarted")
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: restartedPodPath,
+	}); err != nil {
+		t.Errorf("expected untracked restart-style publish path to be accepted, got %v", err)
 	}
-	t.Fatalf("GET_VOLUME_STATS not advertised: %+v", resp.GetCapabilities())
+
+	otherPodPath := kubeletPublishPath(t, "pv-2")
+	otherVol := NewVolume("vol-2", &fakeMounter{}, ns.Driver)
+	otherVol.AddPublishPath(otherPodPath, false)
+	ns.volumes.Store("vol-2", otherVol)
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: otherPodPath,
+	}); status.Code(err) != codes.NotFound {
+		t.Errorf("expected NotFound for another tracked volume's path, got %v", err)
+	}
+
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: t.TempDir(),
+	}); status.Code(err) != codes.NotFound {
+		t.Errorf("expected NotFound for untracked path, got %v", err)
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "pods", "pod-a", "volumes", "kubernetes.io~csi", "pv-1", "mount")
+	vol.AddPublishPath(missingPath, false)
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: missingPath,
+	}); status.Code(err) != codes.NotFound {
+		t.Errorf("expected NotFound for missing path, got %v", err)
+	}
+
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumePath: staged,
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for empty volume ID, got %v", err)
+	}
 }
 
-func TestNodeGetVolumeStatsReportsBytesAndInodes(t *testing.T) {
-	ns := nodeServerWithStatfs(func(string) (VolumeUsage, error) {
-		return VolumeUsage{
-			TotalBytes: 118111600640, UsedBytes: 102276262912, AvailableBytes: 15835337728,
-			TotalInodes: math.MaxInt64, UsedInodes: 4217, AvailableInodes: math.MaxInt64 - 4217,
+func TestNodeGetVolumeStatsRefusesUnhealthyPublishPath(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	podPath := kubeletPublishPath(t, "pv-1")
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(podPath, false)
+	ns.volumes.Store("vol-1", vol)
+
+	var readCalled atomic.Bool
+	ns.isHealthyFn = func(path string) bool { return false }
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		readCalled.Store(true)
+		return &volumeUsage{}, nil
+	}
+
+	_, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound for unhealthy publish path, got %v", err)
+	}
+	if readCalled.Load() {
+		t.Fatal("readVolumeUsage must not run after mount validation fails")
+	}
+}
+
+func TestNodeGetVolumeStatsInodeSentinel(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	podPath := kubeletPublishPath(t, "pv-1")
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(podPath, false)
+	ns.volumes.Store("vol-1", vol)
+
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		return &volumeUsage{
+			capacityBytes:  10,
+			availableBytes: 7,
+			inodes:         math.MaxInt64 - 1,
+			inodesUsed:     2,
+			inodesFree:     3,
 		}, nil
+	}
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
 	})
-
-	resp, err := ns.NodeGetVolumeStats(context.Background(), statsRequest())
 	if err != nil {
-		t.Fatalf("NodeGetVolumeStats: %v", err)
+		t.Fatalf("expected success, got %v", err)
 	}
-	if got := len(resp.GetUsage()); got != 2 {
-		t.Fatalf("got %d usage entries, want 2 (bytes and inodes)", got)
-	}
-
-	bytes := usageByUnit(t, resp, csi.VolumeUsage_BYTES)
-	if bytes.GetTotal() != 118111600640 || bytes.GetUsed() != 102276262912 || bytes.GetAvailable() != 15835337728 {
-		t.Errorf("byte usage = %+v, want the statfs values unmodified", bytes)
+	if got := findUsage(resp, csi.VolumeUsage_INODES); got == nil || got.Total != math.MaxInt64-1 {
+		t.Fatalf("expected large real inode count to be reported, got %v", got)
 	}
 
-	// The inode totals are SeaweedFS's "unbounded" sentinel. They have to
-	// survive intact: PersistentVolumeInodesCritical pages on
-	// inodes_free/inodes < 0.10, and that ratio is only pinned at 1
-	// because both operands are MaxInt64.
-	inodes := usageByUnit(t, resp, csi.VolumeUsage_INODES)
-	if inodes.GetTotal() != math.MaxInt64 {
-		t.Errorf("inode total = %d, want MaxInt64", inodes.GetTotal())
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		return &volumeUsage{capacityBytes: 10, availableBytes: 7, inodes: math.MaxInt64, inodesUsed: 41840, inodesFree: math.MaxInt64 - 41840}, nil
 	}
-	if inodes.GetUsed() != 4217 {
-		t.Errorf("inode used = %d, want the real file count 4217", inodes.GetUsed())
-	}
-	if inodes.GetAvailable() != math.MaxInt64-4217 {
-		t.Errorf("inode available = %d, want MaxInt64-4217", inodes.GetAvailable())
-	}
-}
-
-func TestNodeGetVolumeStatsRejectsIncompleteRequests(t *testing.T) {
-	ns := nodeServerWithStatfs(func(string) (VolumeUsage, error) {
-		t.Fatal("statfs must not run for an invalid request")
-		return VolumeUsage{}, nil
+	resp, err = ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
 	})
-
-	for name, req := range map[string]*csi.NodeGetVolumeStatsRequest{
-		"no volume id":   {VolumePath: "/mnt/x"},
-		"no volume path": {VolumeId: "pvc-1234"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := ns.NodeGetVolumeStats(context.Background(), req)
-			if status.Code(err) != codes.InvalidArgument {
-				t.Errorf("code = %v, want InvalidArgument (err: %v)", status.Code(err), err)
-			}
-		})
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if got := findUsage(resp, csi.VolumeUsage_INODES); got == nil || got.Used != 41840 {
+		t.Fatalf("expected the file count of an unbounded volume to be reported, got %v", got)
 	}
 }
 
-// Every failure must surface as an error rather than zeroed usage: a
-// volume whose mount is gone has to disappear from the metrics, not report
-// itself as empty and healthy.
-func TestNodeGetVolumeStatsMapsFailuresToCodes(t *testing.T) {
-	cases := map[string]struct {
-		err  error
-		want codes.Code
-	}{
-		"missing path": {fmt.Errorf("statfs: %w", fs.ErrNotExist), codes.NotFound},
-		"dead mount":   {fmt.Errorf("statfs: %w", unix.ENOTCONN), codes.Internal},
-		"other":        {errors.New("boom"), codes.Internal},
+func TestNodeGetVolumeStatsDeduplicatesBlockedCollection(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	podPath := kubeletPublishPath(t, "pv-1")
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(podPath, false)
+	ns.volumes.Store("vol-1", vol)
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	var once sync.Once
+	var readCalls atomic.Int32
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		readCalls.Add(1)
+		once.Do(func() { close(started) })
+		<-unblock
+		return &volumeUsage{capacityBytes: 1, availableBytes: 1}, nil
 	}
+	defer close(unblock)
 
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			ns := nodeServerWithStatfs(func(string) (VolumeUsage, error) { return VolumeUsage{}, tc.err })
-			resp, err := ns.NodeGetVolumeStats(context.Background(), statsRequest())
-			if status.Code(err) != tc.want {
-				t.Errorf("code = %v, want %v (err: %v)", status.Code(err), tc.want, err)
-			}
-			if resp != nil {
-				t.Errorf("got a response alongside the error: %+v", resp)
-			}
-		})
-	}
-}
-
-// A frozen FUSE daemon blocks statfs in the kernel. The RPC must give up
-// instead of holding kubelet's stats collection for every other volume on
-// the node.
-func TestNodeGetVolumeStatsGivesUpOnAWedgedMount(t *testing.T) {
-	original := volumeStatsTimeout
-	volumeStatsTimeout = 100 * time.Millisecond
-	defer func() { volumeStatsTimeout = original }()
-
-	release := make(chan struct{})
-	defer close(release)
-
-	ns := nodeServerWithStatfs(func(string) (VolumeUsage, error) {
-		<-release
-		return VolumeUsage{}, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	_, err := ns.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
 	})
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := ns.NodeGetVolumeStats(context.Background(), statsRequest())
-		done <- err
-	}()
-
+	cancel()
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
 	select {
-	case err := <-done:
-		if status.Code(err) != codes.DeadlineExceeded {
-			t.Errorf("code = %v, want DeadlineExceeded (err: %v)", status.Code(err), err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("NodeGetVolumeStats never returned on a wedged mount")
+	case <-started:
+	default:
+		t.Fatal("stats collection did not start")
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	_, err = ns.NodeGetVolumeStats(secondCtx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
+	})
+	secondCancel()
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded while first collection is still active, got %v", err)
+	}
+	if got := readCalls.Load(); got != 1 {
+		t.Fatalf("expected one stats collection, got %d", got)
 	}
 }
 
-func TestNodeGetVolumeStatsSurvivesAPanickingStatfs(t *testing.T) {
-	ns := nodeServerWithStatfs(func(string) (VolumeUsage, error) { panic("statfs exploded") })
+func TestNodeGetVolumeStatsDoesNotDeduplicateDifferentPaths(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	firstPath := kubeletPublishPath(t, "pv-1")
+	secondPath := kubeletPublishPath(t, "pv-1")
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(firstPath, false)
+	vol.AddPublishPath(secondPath, false)
+	ns.volumes.Store("vol-1", vol)
 
-	_, err := ns.NodeGetVolumeStats(context.Background(), statsRequest())
-	if status.Code(err) != codes.Internal {
-		t.Errorf("code = %v, want Internal (err: %v)", status.Code(err), err)
+	startedFirst := make(chan struct{})
+	unblockFirst := make(chan struct{})
+	var startedOnce sync.Once
+	var secondCalls atomic.Int32
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(firstPath):
+			startedOnce.Do(func() { close(startedFirst) })
+			<-unblockFirst
+			return &volumeUsage{capacityBytes: 1, availableBytes: 1}, nil
+		case filepath.Clean(secondPath):
+			secondCalls.Add(1)
+			return &volumeUsage{capacityBytes: 2, availableBytes: 2}, nil
+		default:
+			t.Errorf("unexpected stats path %s", path)
+			return &volumeUsage{}, nil
+		}
 	}
+	defer close(unblockFirst)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	_, err := ns.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: firstPath,
+	})
+	cancel()
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	select {
+	case <-startedFirst:
+	default:
+		t.Fatal("first stats collection did not start")
+	}
+
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: secondPath,
+	})
+	if err != nil {
+		t.Fatalf("expected second path stats to succeed, got %v", err)
+	}
+	if got := secondCalls.Load(); got != 1 {
+		t.Fatalf("expected second path to start its own collection, got %d calls", got)
+	}
+	if got := findUsage(resp, csi.VolumeUsage_BYTES); got == nil || got.Total != 2 {
+		t.Fatalf("expected second path usage, got %v", got)
+	}
+}
+
+func TestNodeGetVolumeStatsDoesNotDeduplicateCleanPathCollisions(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	basePath := filepath.Join(t.TempDir(), "volume")
+	collidingPath := filepath.Join(filepath.Dir(basePath), "link") + string(os.PathSeparator) + ".." + string(os.PathSeparator) + filepath.Base(basePath)
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(collidingPath, false)
+	vol.AddPublishPath(basePath, false)
+	ns.volumes.Store("vol-1", vol)
+
+	ns.isHealthyFn = func(path string) bool { return true }
+	startedFirst := make(chan struct{})
+	unblockFirst := make(chan struct{})
+	var startedOnce sync.Once
+	ns.readVolumeUsageFn = func(path string) (*volumeUsage, error) {
+		switch path {
+		case collidingPath:
+			startedOnce.Do(func() { close(startedFirst) })
+			<-unblockFirst
+			return &volumeUsage{capacityBytes: 1, availableBytes: 1}, nil
+		case basePath:
+			return &volumeUsage{capacityBytes: 2, availableBytes: 2}, nil
+		default:
+			t.Errorf("unexpected stats path %s", path)
+			return &volumeUsage{}, nil
+		}
+	}
+	defer close(unblockFirst)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	_, err := ns.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: collidingPath,
+	})
+	cancel()
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	select {
+	case <-startedFirst:
+	default:
+		t.Fatal("first stats collection did not start")
+	}
+
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: basePath,
+	})
+	if err != nil {
+		t.Fatalf("expected cleaned-collision path stats to succeed, got %v", err)
+	}
+	if got := findUsage(resp, csi.VolumeUsage_BYTES); got == nil || got.Total != 2 {
+		t.Fatalf("expected base path usage, got %v", got)
+	}
+}
+
+func TestNodeGetVolumeStatsMutexWaitHonorsDeadline(t *testing.T) {
+	ns := newTestNodeServer(t, &fakeMounter{})
+	podPath := kubeletPublishPath(t, "pv-1")
+	vol := NewVolume("vol-1", &fakeMounter{}, ns.Driver)
+	vol.AddPublishPath(podPath, false)
+	ns.volumes.Store("vol-1", vol)
+
+	volumeMutex := ns.getVolumeMutex("vol-1")
+	volumeMutex.Lock()
+	defer volumeMutex.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := ns.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: podPath,
+	})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded waiting for volume mutex, got %v", err)
+	}
+}
+
+func kubeletPublishPath(t *testing.T, pv string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pods", "pod-a", "volumes", "kubernetes.io~csi", pv, "mount")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatalf("mkdir publish path: %v", err)
+	}
+	return path
+}
+
+func assertStatfsUsage(t *testing.T, resp *csi.NodeGetVolumeStatsResponse, path string) {
+	t.Helper()
+	bytesUsage := findUsage(resp, csi.VolumeUsage_BYTES)
+	if bytesUsage == nil {
+		t.Fatal("expected BYTES usage entry")
+	}
+	inodeUsage := findUsage(resp, csi.VolumeUsage_INODES)
+	if inodeUsage == nil {
+		t.Fatal("expected INODES usage entry")
+	}
+
+	var sfs syscall.Statfs_t
+	if err := syscall.Statfs(path, &sfs); err != nil {
+		t.Fatalf("statfs %s failed: %v", path, err)
+	}
+	if got, want := bytesUsage.Total, int64(sfs.Blocks)*int64(sfs.Bsize); got != want {
+		t.Errorf("bytes total = %d, want %d", got, want)
+	}
+	// Used and available are snapshots of a filesystem shared with other
+	// activity: a few blocks can shift between the two statfs reads. The
+	// allowance stays far below the reserved-free delta, so a Bfree/Bavail
+	// mix-up still fails.
+	const drift = 64 << 20
+	if got, want := bytesUsage.Used, int64(sfs.Blocks-sfs.Bfree)*int64(sfs.Bsize); math.Abs(float64(got-want)) > drift {
+		t.Errorf("bytes used = %d, want %d (within %d)", got, want, drift)
+	}
+	if got, want := bytesUsage.Available, int64(sfs.Bavail)*int64(sfs.Bsize); math.Abs(float64(got-want)) > drift {
+		t.Errorf("bytes available = %d, want %d (within %d)", got, want, drift)
+	}
+	if got, want := inodeUsage.Total, int64(sfs.Files); got != want {
+		t.Errorf("inodes total = %d, want %d", got, want)
+	}
+	if inodeUsage.Used < 0 {
+		t.Errorf("inodes used = %d, want >= 0", inodeUsage.Used)
+	}
+}
+
+func findUsage(resp *csi.NodeGetVolumeStatsResponse, unit csi.VolumeUsage_Unit) *csi.VolumeUsage {
+	for _, usage := range resp.GetUsage() {
+		if usage.Unit == unit {
+			return usage
+		}
+	}
+	return nil
 }

@@ -274,16 +274,24 @@ jobs:
           # rather than a failure anyone would notice.
           #
           # Kubelet's volume-stats aggregator runs on a ~1 minute period,
-          # so poll rather than sampling once.
+          # and its first sample can predate the master learning about the
+          # files the pod just wrote (volume heartbeat, plus weed mount's
+          # 20s statistics cache), so poll until the used-inode count
+          # arrives rather than stopping at the first sample.
           NODE=$(kubectl get pod test-pod -o jsonpath='{.spec.nodeName}')
+
+          inodes_used() {
+            echo "$METRICS" | awk '/^kubelet_volume_stats_inodes_used/ { print $2 + 0 }'
+          }
 
           for i in $(seq 1 18); do
             METRICS=$(kubectl get --raw "/api/v1/nodes/${NODE}/proxy/metrics" \
               | grep 'kubelet_volume_stats_.*persistentvolumeclaim="test-pvc"' || true)
-            if [ -n "$METRICS" ]; then
+            USED=$(inodes_used)
+            echo "attempt $i: inodes_used=${USED:-absent}"
+            if [ -n "$USED" ] && [ "$USED" -gt 0 ]; then
               break
             fi
-            echo "attempt $i: no volume stats yet, waiting..."
             sleep 10
           done
 
@@ -301,12 +309,13 @@ jobs:
           # INODES usage entry is being dropped or mis-populated. Its total
           # and free counts are SeaweedFS's MaxInt64 "unbounded" sentinel;
           # only the used count carries information.
-          echo "$METRICS" | awk '
-            /^kubelet_volume_stats_inodes_used/ { found = 1; if ($2 + 0 > 0) ok = 1 }
-            END {
-              if (!found) { print "FAIL: kubelet_volume_stats_inodes_used is missing"; exit 1 }
-              if (!ok)    { print "FAIL: kubelet_volume_stats_inodes_used is zero"; exit 1 }
-            }'
+          USED=$(inodes_used)
+          if [ -z "$USED" ]; then
+            echo "FAIL: kubelet_volume_stats_inodes_used is missing"; exit 1
+          fi
+          if [ "$USED" -le 0 ]; then
+            echo "FAIL: kubelet_volume_stats_inodes_used is zero"; exit 1
+          fi
 
           echo "PASS: kubelet reports byte and inode stats for test-pvc"
 

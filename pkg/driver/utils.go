@@ -45,7 +45,6 @@ func NewNodeServer(n *SeaweedFsDriver) *NodeServer {
 		cleanupStagingFn: cleanupStaleStagingPath,
 		unmountFn:        mountutil.Unmount,
 		bindMountFn:      defaultBindMount,
-		statfsFn:         statfsUsage,
 	}
 	// Adopt what the mount service already owns before the first sweep, so
 	// a plugin restart does not silently stop monitoring live mounts.
@@ -149,6 +148,7 @@ func checkMount(targetPath string) (bool, error) {
 			if err := mountutil.Unmount(targetPath); err != nil {
 				return false, err
 			}
+			resetStatfsProbe(targetPath)
 			isMnt, err = mountutil.IsMountPoint(targetPath)
 		} else {
 			return false, err

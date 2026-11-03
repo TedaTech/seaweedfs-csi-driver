@@ -257,9 +257,36 @@ spec:
 Modifiable parameters are the mount-time knobs: `diskType`, `replication`,
 `ttl`, `dataCenter`, `dataLocality`, `uidMap`, `gidMap`, `chunkSizeLimitMB`,
 `volumeServerAccess`, `readRetryTime`, `concurrentReaders`,
-`concurrentWriters`, `cacheCapacityMB`, `cacheMetaTtlSec`. Structural keys
-(`collection`, `path`, `parentDir`, `volumeName`, capacity) are rejected, as
-are invalid values (unknown `dataLocality`, non-integer numeric options).
+`concurrentWriters`, `cacheCapacityMB`, `cacheMetaTtlSec`, `writebackCache`,
+`metadataFlushSeconds`, `dlm`. Structural keys (`collection`, `path`,
+`parentDir`, `volumeName`, capacity) are rejected, as are invalid values
+(unknown `dataLocality`, non-integer numeric options, non-boolean flags).
+
+For regenerable-data workloads (build caches, scratch workspaces) a
+writeback-profiled class trades crash-safety for write throughput:
+
+```
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: seaweedfs-writeback
+driverName: seaweedfs-csi-driver
+parameters:
+  writebackCache: "true"
+  metadataFlushSeconds: "300"
+```
+
+`writebackCache=true` enables FUSE writeback caching — data accepted before
+the last flush is lost if the mount crashes. `metadataFlushSeconds` is
+unrelated to that window: it periodically flushes file **metadata** to the
+filer so long-running writes are not purged by `volume.fsck`; it does not
+make cached data crash-safe.
+
+`dlm` is mutually exclusive with `writebackCache`: weed mount runs
+single-writer under writeback and silently disables the distributed lock
+manager when both are requested, so the driver rejects the combination at
+modify/create time. Set `dlm` on a separate class (without writeback) when
+concurrent mounts need coordination.
 
 Notes:
 
@@ -268,6 +295,10 @@ Notes:
   filer (under `/.csi/vac/<volume>`, outside `/buckets`); the volume picks
   them up at its next stage (pod restart or reschedule).
 - The entry is removed with the volume on `DeleteVolume`.
+- On a filer with security enabled the store signs requests with the
+  `jwt.filer_signing.key` / `jwt.filer_signing.read.key` from the mounted
+  `security.toml`; the chart mounts it into both plugin containers. Set
+  `vacStore.useTls` so the tokens are not sent over plain HTTP.
 - The cluster's `csi-resizer` must support VolumeAttributesClass against the
   k8s API version in use: released v1.14.0 still watches the
   `storage.k8s.io/v1beta1` API removed in Kubernetes 1.34 — use a build from
